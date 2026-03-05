@@ -123,6 +123,53 @@ find_ocr_script(void) {
     return NULL;
 }
 
+// Find a Python interpreter with PaddleOCR available. Tries:
+//   1. SCRCPY_OCR_PYTHON environment variable
+//   2. ocr-venv/bin/python next to the executable
+//   3. ocr-venv/bin/python next to the script
+//   4. "python3" (system PATH)
+static char *
+find_python(const char *script_path) {
+    // 1. Environment variable
+    const char *env = getenv("SCRCPY_OCR_PYTHON");
+    if (env && sc_file_is_regular(env)) {
+        return strdup(env);
+    }
+
+    // 2. ocr-venv next to the executable
+    char *exe_venv = sc_file_get_local_path("ocr-venv/bin/python");
+    if (exe_venv && sc_file_is_regular(exe_venv)) {
+        return exe_venv;
+    }
+    free(exe_venv);
+
+    // 3. ocr-venv next to the script
+    if (script_path) {
+        char *script_copy = strdup(script_path);
+        if (script_copy) {
+            char *slash = strrchr(script_copy, '/');
+            if (slash) {
+                *slash = '\0';
+                size_t len = strlen(script_copy) + 32;
+                char *venv_python = malloc(len);
+                if (venv_python) {
+                    snprintf(venv_python, len, "%s/ocr-venv/bin/python",
+                             script_copy);
+                    if (sc_file_is_regular(venv_python)) {
+                        free(script_copy);
+                        return venv_python;
+                    }
+                    free(venv_python);
+                }
+            }
+            free(script_copy);
+        }
+    }
+
+    // 4. System python3
+    return strdup("python3");
+}
+
 bool
 sc_ai_ocr_start(struct sc_ai_ocr *ocr) {
     memset(ocr, 0, sizeof(*ocr));
@@ -133,17 +180,19 @@ sc_ai_ocr_start(struct sc_ai_ocr *ocr) {
         return false;
     }
 
-    LOGI("AI OCR: starting daemon: %s", script);
+    char *python = find_python(script);
+    LOGI("AI OCR: starting daemon: %s %s", python, script);
 
-    const char *const argv[] = {"python3", script, NULL};
+    const char *const argv[] = {python, script, NULL};
 
     sc_pipe pin, pout;
     enum sc_process_result r =
         sc_process_execute_p(argv, &ocr->pid, 0, &pin, &pout, NULL);
     free(script);
+    free(python);
 
     if (r != SC_PROCESS_SUCCESS) {
-        LOGW("AI OCR: failed to start python3 (result=%d), OCR disabled", r);
+        LOGW("AI OCR: failed to start python (result=%d), OCR disabled", r);
         return false;
     }
 
