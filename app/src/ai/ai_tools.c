@@ -7,6 +7,7 @@
 
 #include "ai/ai_agent.h"
 #include "ai/ai_frame_sink.h"
+#include "ai/ai_ocr.h"
 #include "ai/screenshot.h"
 #include "../../deps/cjson/cJSON.h"
 #include "android/input.h"
@@ -268,8 +269,17 @@ tool_position_click(struct sc_ai_tools *tools, cJSON *args) {
         SDL_Delay(150);
     }
 
-    return ok ? strdup("{\"success\": true}")
-              : strdup("{\"error\": \"failed to inject touch\"}");
+    if (ok) {
+        if (tools->agent) {
+            sc_ai_agent_record_touch(tools->agent, x, y);
+        }
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "{\"success\":true,\"clicked\":[%d,%d],\"screen\":[%d,%d]}",
+                 (int)x, (int)y, (int)sw, (int)sh);
+        return strdup(buf);
+    }
+    return strdup("{\"error\": \"failed to inject touch\"}");
 }
 
 static char *
@@ -305,8 +315,18 @@ tool_position_long_press(struct sc_ai_tools *tools, cJSON *args) {
                           AMOTION_EVENT_ACTION_UP);
     }
 
-    return ok ? strdup("{\"success\": true}")
-              : strdup("{\"error\": \"failed to inject long press\"}");
+    if (ok) {
+        if (tools->agent) {
+            sc_ai_agent_record_touch(tools->agent, x, y);
+        }
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "{\"success\":true,\"pressed\":[%d,%d],\"duration_ms\":%d,"
+                 "\"screen\":[%d,%d]}",
+                 (int)x, (int)y, duration_ms, (int)sw, (int)sh);
+        return strdup(buf);
+    }
+    return strdup("{\"error\": \"failed to inject long press\"}");
 }
 
 static char *
@@ -368,8 +388,16 @@ tool_swipe(struct sc_ai_tools *tools, cJSON *args) {
         SDL_Delay(200);
     }
 
-    return ok ? strdup("{\"success\": true}")
-              : strdup("{\"error\": \"failed to inject swipe up\"}");
+    if (ok) {
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+                 "{\"success\":true,\"from\":[%d,%d],\"to\":[%d,%d],"
+                 "\"duration_ms\":%d,\"screen\":[%d,%d]}",
+                 (int)x1, (int)y1, (int)x2, (int)y2,
+                 duration_ms, (int)sw, (int)sh);
+        return strdup(buf);
+    }
+    return strdup("{\"error\": \"failed to inject swipe up\"}");
 }
 
 static char *
@@ -489,6 +517,17 @@ tool_screenshot(struct sc_ai_tools *tools, cJSON *args) {
     uint16_t w = ss.width;
     uint16_t h = ss.height;
 
+    // Run OCR on the screenshot
+    char *ocr_text = NULL;
+    if (agent->ocr_enabled) {
+        struct sc_ai_ocr_result ocr_result;
+        if (sc_ai_ocr_process(&agent->ocr, ss.png_data, ss.png_size,
+                               &ocr_result)) {
+            ocr_text = sc_ai_ocr_format_prompt(&ocr_result);
+            sc_ai_ocr_result_destroy(&ocr_result);
+        }
+    }
+
     // Update agent state and add screenshot as user image message
     sc_mutex_lock(&agent->mutex);
     free(agent->latest_png_data);
@@ -502,12 +541,19 @@ tool_screenshot(struct sc_ai_tools *tools, cJSON *args) {
     sc_ai_tools_set_screen_size(tools, w, h);
     sc_ai_tools_set_frame_size(tools, orig_w, orig_h);
 
-    char text[256];
-    snprintf(text, sizeof(text),
-             "[Screen: %dx%d pixels] (fresh screenshot)", w, h);
+    char text[4096];
+    if (ocr_text) {
+        snprintf(text, sizeof(text),
+                 "[Screen: %dx%d pixels] (fresh screenshot)\n%s", w, h,
+                 ocr_text);
+    } else {
+        snprintf(text, sizeof(text),
+                 "[Screen: %dx%d pixels] (fresh screenshot)", w, h);
+    }
     sc_ai_message_list_push_image(&agent->messages, text, ss.base64_data);
     sc_mutex_unlock(&agent->mutex);
 
+    free(ocr_text);
     sc_ai_screenshot_destroy(&ss);
 
     char result[256];

@@ -7,6 +7,7 @@
 #include <SDL2/SDL.h>
 #include <libavutil/frame.h>
 
+#include "ai/ai_ocr.h"
 #include "ai/screenshot.h"
 #include "../../deps/cjson/cJSON.h"
 #include "util/log.h"
@@ -24,13 +25,28 @@
     "- The screenshot image is EXACTLY WxH pixels. Use pixel coordinates.\n" \
     "- Valid X range: 0 to W-1. Valid Y range: 0 to H-1.\n" \
     "- (0,0) is the top-left corner. (W-1, H-1) is the bottom-right.\n" \
-    "- To tap a UI element, estimate the CENTER of that element in pixels.\n" \
     "- Do NOT normalize coordinates to 0-1000 or percentages. Use raw pixels.\n" \
     "- Example: if screen is 1024x460 and a button is at the center, " \
     "tap (512, 230).\n\n" \
-    "After each action, take a screenshot to verify the result before " \
-    "deciding next steps.\n\n" \
-    "Always confirm your actions by describing what you did."
+    "Tapping strategy:\n" \
+    "- IMPORTANT: When [Detected UI text] data is provided with coordinates, " \
+    "ALWAYS use those OCR coordinates for tapping. They are precise.\n" \
+    "- For icons or elements without OCR text, estimate the center visually.\n" \
+    "- To tap a button or UI element, aim for the CENTER of its visible area.\n" \
+    "- For text labels/buttons: the tap point is the center of the text " \
+    "bounding box, NOT the start of the text.\n" \
+    "- If a tap did not work (screen unchanged), the coordinates were likely " \
+    "off. Re-examine the screenshot carefully and try a slightly different " \
+    "position.\n" \
+    "- Tool results include the actual coordinates sent (e.g. " \
+    "\"clicked\":[x,y]). Compare these with the intended target to debug " \
+    "misses.\n\n" \
+    "IMPORTANT - Before every action:\n" \
+    "- State what you intend to tap and WHY (e.g. \"I will tap the 'Start' " \
+    "button at approximately (500,300) to begin the game.\").\n" \
+    "- After the action, take a screenshot to verify the result.\n" \
+    "- If the screen did not change, your tap missed. Try different " \
+    "coordinates — do NOT repeat the same position."
 
 static void
 log_to_train(struct sc_ai_agent *agent, const char *role, const char *content) {
@@ -94,18 +110,45 @@ process_prompt(struct sc_ai_agent *agent, const char *prompt) {
     }
     av_frame_free(&frame);
 
-    // Add user message with screenshot (include resolution info)
+    // Trim history to prevent token explosion (keep system + last 19 msgs)
+    sc_mutex_lock(&agent->mutex);
+    sc_ai_message_list_trim(&agent->messages, 20);
+    sc_mutex_unlock(&agent->mutex);
+
+    // Run OCR on the screenshot JPEG data
+    char *ocr_text = NULL;
+    if (has_screenshot && agent->ocr_enabled) {
+        struct sc_ai_ocr_result ocr_result;
+        if (sc_ai_ocr_process(&agent->ocr, ss.png_data, ss.png_size,
+                               &ocr_result)) {
+            ocr_text = sc_ai_ocr_format_prompt(&ocr_result);
+            if (ocr_text) {
+                LOGI("AI OCR: detected %zu text regions", ocr_result.count);
+            }
+            sc_ai_ocr_result_destroy(&ocr_result);
+        }
+    }
+
+    // Add user message with screenshot (include resolution info + OCR)
     sc_mutex_lock(&agent->mutex);
     if (has_screenshot) {
-        char enhanced[4096];
-        snprintf(enhanced, sizeof(enhanced),
-                 "[Screen: %dx%d pixels]\n%s", ss.width, ss.height, prompt);
+        char enhanced[8192];
+        if (ocr_text) {
+            snprintf(enhanced, sizeof(enhanced),
+                     "[Screen: %dx%d pixels]\n%s\n\n%s",
+                     ss.width, ss.height, ocr_text, prompt);
+        } else {
+            snprintf(enhanced, sizeof(enhanced),
+                     "[Screen: %dx%d pixels]\n%s", ss.width, ss.height,
+                     prompt);
+        }
         sc_ai_message_list_push_image(&agent->messages, enhanced,
                                        ss.base64_data);
     } else {
         sc_ai_message_list_push(&agent->messages, "user", prompt);
     }
     sc_mutex_unlock(&agent->mutex);
+    free(ocr_text);
 
     if (has_screenshot) {
         sc_ai_screenshot_destroy(&ss);
@@ -253,12 +296,15 @@ worker_thread_fn(void *data) {
         char *prompt = agent->pending_prompt;
         agent->pending_prompt = NULL;
         agent->has_pending_prompt = false;
+        agent->worker_busy = true;
         sc_mutex_unlock(&agent->mutex);
 
         process_prompt(agent, prompt);
         free(prompt);
 
         sc_mutex_lock(&agent->mutex);
+        agent->worker_busy = false;
+        sc_cond_signal(&agent->cond); // wake auto_thread
     }
     sc_mutex_unlock(&agent->mutex);
 
@@ -268,6 +314,7 @@ worker_thread_fn(void *data) {
 static int
 auto_thread_fn(void *data) {
     struct sc_ai_agent *agent = data;
+    bool rules_sent = false;
 
     while (true) {
         sc_mutex_lock(&agent->mutex);
@@ -278,43 +325,69 @@ auto_thread_fn(void *data) {
 
         bool running = agent->auto_running;
         bool has_rules = agent->game_rules && agent->game_rules[0] != '\0';
-        int interval = agent->auto_interval_ms;
         char *rules_copy = NULL;
-        if (running && has_rules) {
+        if (running && has_rules && !rules_sent) {
             rules_copy = strdup(agent->game_rules);
         }
+        int repeats = agent->repeat_count;
         sc_mutex_unlock(&agent->mutex);
 
-        if (!running || !has_rules) {
-            free(rules_copy);
+        if (!running) {
+            rules_sent = false;
+            SDL_Delay(100);
+            continue;
+        }
+        if (!has_rules) {
             SDL_Delay(100);
             continue;
         }
 
-        // Build prompt with game rules
-        size_t prompt_len = strlen(rules_copy) + 256;
-        char *prompt = malloc(prompt_len);
-        if (prompt) {
-            snprintf(prompt, prompt_len,
-                "Follow the game rules below, look at the screenshot, "
-                "and use the available tools to play:\n\n%s", rules_copy);
-            sc_ai_agent_submit_prompt(agent, prompt);
-            // prompt ownership transferred to submit_prompt
-        }
-        free(rules_copy);
-
-        // Wait interval, checking stop every 100ms
-        int waited = 0;
-        while (waited < interval) {
-            sc_mutex_lock(&agent->mutex);
-            if (agent->stopped || !agent->auto_running) {
-                sc_mutex_unlock(&agent->mutex);
-                break;
+        // Build prompt
+        char *prompt;
+        if (rules_copy) {
+            // First iteration: send full rules
+            size_t prompt_len = strlen(rules_copy) + 512;
+            prompt = malloc(prompt_len);
+            if (prompt) {
+                snprintf(prompt, prompt_len,
+                    "Follow the game rules below, look at the screenshot, "
+                    "and use the available tools to play. "
+                    "Before each action, briefly state WHAT you intend to "
+                    "tap and WHY.\n\n%s", rules_copy);
             }
-            sc_mutex_unlock(&agent->mutex);
-            SDL_Delay(100);
-            waited += 100;
+            free(rules_copy);
+            rules_sent = true;
+        } else if (repeats >= 3) {
+            // Same coordinates repeated — button is not being hit
+            prompt = strdup(
+                "WARNING: Your last several taps hit the SAME coordinates "
+                "but the screen did not change. The button is NOT being "
+                "pressed. You are likely tapping the wrong position. "
+                "Take a fresh screenshot, carefully re-examine the UI, "
+                "and try a DIFFERENT coordinate. State what you see and "
+                "where you will tap next.");
+        } else {
+            // Normal continuation
+            prompt = strdup(
+                "Continue playing. Take a screenshot and decide your "
+                "next action according to the game rules. Before each "
+                "action, briefly state WHAT you intend to tap and WHY.");
         }
+
+        if (prompt) {
+            sc_ai_agent_submit_prompt(agent, prompt);
+        }
+
+        // Wait for worker to finish processing (completion-based)
+        sc_mutex_lock(&agent->mutex);
+        while (!agent->stopped && agent->auto_running
+                && (agent->worker_busy || agent->has_pending_prompt)) {
+            sc_cond_wait(&agent->cond, &agent->mutex);
+        }
+        sc_mutex_unlock(&agent->mutex);
+
+        // Brief cooldown to let UI respond before next iteration
+        SDL_Delay(1000);
     }
 
     return 0;
@@ -349,9 +422,12 @@ sc_ai_agent_init(struct sc_ai_agent *agent,
     agent->system_prompt = strdup(SYSTEM_PROMPT_DEFAULT);
     sc_ai_message_list_push(&agent->messages, "system", agent->system_prompt);
 
-    agent->auto_interval_ms = 5000;
     agent->auto_running = false;
+    agent->worker_busy = false;
     agent->game_rules = NULL;
+    agent->last_touch_x = -1;
+    agent->last_touch_y = -1;
+    agent->repeat_count = 0;
 
     // Set up train log path
     const char *home = getenv("HOME");
@@ -370,6 +446,14 @@ bool
 sc_ai_agent_start(struct sc_ai_agent *agent) {
     if (!sc_openrouter_init()) {
         return false;
+    }
+
+    // Start OCR daemon (non-fatal if unavailable)
+    agent->ocr_enabled = sc_ai_ocr_start(&agent->ocr);
+    if (agent->ocr_enabled) {
+        LOGI("AI OCR: enabled");
+    } else {
+        LOGW("AI OCR: disabled (PaddleOCR not available)");
     }
 
     agent->stopped = false;
@@ -401,6 +485,11 @@ sc_ai_agent_stop(struct sc_ai_agent *agent) {
     agent->auto_running = false;
     sc_cond_signal(&agent->cond);
     sc_mutex_unlock(&agent->mutex);
+
+    if (agent->ocr_enabled) {
+        sc_ai_ocr_stop(&agent->ocr);
+        agent->ocr_enabled = false;
+    }
 }
 
 void
@@ -456,13 +545,29 @@ void
 sc_ai_agent_set_auto_running(struct sc_ai_agent *agent, bool running) {
     sc_mutex_lock(&agent->mutex);
     agent->auto_running = running;
+    if (running) {
+        agent->repeat_count = 0;
+        agent->last_touch_x = -1;
+        agent->last_touch_y = -1;
+    }
+    sc_cond_signal(&agent->cond); // wake auto_thread if waiting
     sc_mutex_unlock(&agent->mutex);
 }
 
 void
-sc_ai_agent_set_auto_interval(struct sc_ai_agent *agent, int interval_ms) {
+sc_ai_agent_record_touch(struct sc_ai_agent *agent, int32_t x, int32_t y) {
     sc_mutex_lock(&agent->mutex);
-    agent->auto_interval_ms = interval_ms;
+    // Consider "same" if within 10px tolerance
+    if (abs(x - agent->last_touch_x) <= 10
+            && abs(y - agent->last_touch_y) <= 10) {
+        agent->repeat_count++;
+    } else {
+        agent->last_touch_x = x;
+        agent->last_touch_y = y;
+        agent->repeat_count = 1;
+    }
+    LOGD("Touch repeat tracking: (%d,%d) count=%d",
+         (int)x, (int)y, agent->repeat_count);
     sc_mutex_unlock(&agent->mutex);
 }
 

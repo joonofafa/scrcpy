@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "ai/ai_frame_sink.h"
+#include "ai/ai_ocr.h"
 #include "ai/ai_tools.h"
 #include "ai/openrouter.h"
 #include "util/thread.h"
@@ -26,6 +27,7 @@ struct sc_ai_agent {
     // Pending prompt (UI -> Worker)
     char *pending_prompt;
     bool has_pending_prompt;
+    bool worker_busy; // true while worker is processing a prompt
 
     // Conversation history (Worker -> UI)
     struct sc_ai_message_list messages;
@@ -41,13 +43,21 @@ struct sc_ai_agent {
     uint16_t screen_width;
     uint16_t screen_height;
 
-    // Auto-play system (replaces macro system)
+    // Auto-play system (completion-based loop)
     sc_thread auto_thread;
     bool auto_running;
-    int auto_interval_ms; // 5000, 10000, 15000
 
     // Game rules for auto-play
     char *game_rules;
+
+    // Repeated action detection
+    int32_t last_touch_x;
+    int32_t last_touch_y;
+    int repeat_count;
+
+    // OCR
+    struct sc_ai_ocr ocr;
+    bool ocr_enabled;
 
     // Train log
     char *train_log_path;
@@ -92,8 +102,9 @@ sc_ai_agent_set_config(struct sc_ai_agent *agent,
 void
 sc_ai_agent_set_auto_running(struct sc_ai_agent *agent, bool running);
 
+// Record a touch action for repeat detection
 void
-sc_ai_agent_set_auto_interval(struct sc_ai_agent *agent, int interval_ms);
+sc_ai_agent_record_touch(struct sc_ai_agent *agent, int32_t x, int32_t y);
 
 // Game rules management
 void
