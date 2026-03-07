@@ -235,6 +235,33 @@ clamp_coords(int32_t *x, int32_t *y, uint16_t sw, uint16_t sh) {
     }
 }
 
+// Map one axis from screenshot space [0..src-1] to frame space [0..dst-1].
+// Uses endpoint-preserving scaling with rounding to reduce systematic drift.
+static int32_t
+map_axis_rounded(int32_t value, uint16_t src, uint16_t dst) {
+    if (src <= 1 || dst <= 1) {
+        return 0;
+    }
+
+    int64_t num = (int64_t) value * (dst - 1);
+    int64_t den = src - 1;
+    return (int32_t) ((num + den / 2) / den);
+}
+
+static bool
+map_screen_to_frame(int32_t sx, int32_t sy,
+                    uint16_t sw, uint16_t sh,
+                    uint16_t fw, uint16_t fh,
+                    int32_t *fx, int32_t *fy) {
+    if (!sw || !sh || !fw || !fh) {
+        return false;
+    }
+
+    *fx = map_axis_rounded(sx, sw, fw);
+    *fy = map_axis_rounded(sy, sh, fh);
+    return true;
+}
+
 static char *
 tool_position_click(struct sc_ai_tools *tools, cJSON *args) {
     cJSON *jx = cJSON_GetObjectItem(args, "x");
@@ -249,11 +276,16 @@ tool_position_click(struct sc_ai_tools *tools, cJSON *args) {
     uint16_t sh = tools->screen_height;
     clamp_coords(&x, &y, sw, sh);
 
-    // Scale from downscaled AI coordinates to original frame coordinates
+    // Scale from AI screenshot coordinates to original frame coordinates
     uint16_t fw = tools->frame_width ? tools->frame_width : sw;
     uint16_t fh = tools->frame_height ? tools->frame_height : sh;
-    int32_t fx = (int32_t)((int64_t)x * fw / sw);
-    int32_t fy = (int32_t)((int64_t)y * fh / sh);
+    int32_t fx;
+    int32_t fy;
+    if (!map_screen_to_frame(x, y, sw, sh, fw, fh, &fx, &fy)) {
+        LOGW("AI tool: invalid dimensions screen=%ux%u frame=%ux%u",
+             (unsigned) sw, (unsigned) sh, (unsigned) fw, (unsigned) fh);
+        return strdup("{\"error\": \"invalid screen/frame dimensions\"}");
+    }
 
     LOGI("AI tool: position_click(%d, %d) screen=%dx%d -> frame(%d, %d) frame=%dx%d",
          x, y, sw, sh, fx, fy, fw, fh);
@@ -304,11 +336,16 @@ tool_position_long_press(struct sc_ai_tools *tools, cJSON *args) {
     uint16_t sh = tools->screen_height;
     clamp_coords(&x, &y, sw, sh);
 
-    // Scale from downscaled AI coordinates to original frame coordinates
+    // Scale from AI screenshot coordinates to original frame coordinates
     uint16_t fw = tools->frame_width ? tools->frame_width : sw;
     uint16_t fh = tools->frame_height ? tools->frame_height : sh;
-    int32_t fx = (int32_t)((int64_t)x * fw / sw);
-    int32_t fy = (int32_t)((int64_t)y * fh / sh);
+    int32_t fx;
+    int32_t fy;
+    if (!map_screen_to_frame(x, y, sw, sh, fw, fh, &fx, &fy)) {
+        LOGW("AI tool: invalid dimensions screen=%ux%u frame=%ux%u",
+             (unsigned) sw, (unsigned) sh, (unsigned) fw, (unsigned) fh);
+        return strdup("{\"error\": \"invalid screen/frame dimensions\"}");
+    }
 
     LOGI("AI tool: position_long_press(%d, %d, %dms) screen=%dx%d -> frame(%d, %d) frame=%dx%d",
          x, y, duration_ms, sw, sh, fx, fy, fw, fh);
@@ -355,13 +392,19 @@ tool_swipe(struct sc_ai_tools *tools, cJSON *args) {
     clamp_coords(&x1, &y1, sw, sh);
     clamp_coords(&x2, &y2, sw, sh);
 
-    // Scale from downscaled AI coordinates to original frame coordinates
+    // Scale from AI screenshot coordinates to original frame coordinates
     uint16_t fw = tools->frame_width ? tools->frame_width : sw;
     uint16_t fh = tools->frame_height ? tools->frame_height : sh;
-    int32_t fx1 = (int32_t)((int64_t)x1 * fw / sw);
-    int32_t fy1 = (int32_t)((int64_t)y1 * fh / sh);
-    int32_t fx2 = (int32_t)((int64_t)x2 * fw / sw);
-    int32_t fy2 = (int32_t)((int64_t)y2 * fh / sh);
+    int32_t fx1;
+    int32_t fy1;
+    int32_t fx2;
+    int32_t fy2;
+    if (!map_screen_to_frame(x1, y1, sw, sh, fw, fh, &fx1, &fy1)
+            || !map_screen_to_frame(x2, y2, sw, sh, fw, fh, &fx2, &fy2)) {
+        LOGW("AI tool: invalid dimensions screen=%ux%u frame=%ux%u",
+             (unsigned) sw, (unsigned) sh, (unsigned) fw, (unsigned) fh);
+        return strdup("{\"error\": \"invalid screen/frame dimensions\"}");
+    }
 
     LOGI("AI tool: swipe(%d,%d -> %d,%d, %dms) screen=%dx%d -> frame(%d,%d -> %d,%d) frame=%dx%d",
          x1, y1, x2, y2, duration_ms, sw, sh, fx1, fy1, fx2, fy2, fw, fh);
