@@ -474,7 +474,7 @@ static const char WEB_UI_HTML[] =
 "<!-- Right Panel: AI -->\n"
 "<div id=\"panel-ai\">\n"
 "  <header>\n"
-"    <h1>scrcpy AI Control</h1>\n"
+"    <h1>SCRCPY AI CONTROLLER</h1>\n"
 "    <span class=\"status\" id=\"status\">Connecting...</span>\n"
 "  </header>\n"
 "  <div class=\"ai-container\">\n"
