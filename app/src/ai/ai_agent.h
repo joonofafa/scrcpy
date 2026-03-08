@@ -166,4 +166,11 @@ sc_ai_agent_set_train_tree(struct sc_ai_agent *agent, const char *json);
 char *
 sc_ai_agent_get_train_tree(struct sc_ai_agent *agent);
 
+// Match current screenshot against known states in tree (caller must free)
+// Returns matched state label, or "UNKNOWN" if no match
+char *
+sc_ai_agent_match_state(struct sc_ai_agent *agent,
+                        const char *base64_data,
+                        uint16_t width, uint16_t height);
+
 #endif

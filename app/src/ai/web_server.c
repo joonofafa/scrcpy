@@ -122,6 +122,25 @@ build_state_json(struct sc_ai_agent *agent) {
     cJSON_AddStringToObject(root, "game_rules",
         agent->game_rules ? agent->game_rules : "");
 
+    // Play mode: tree > rules > none
+    if (agent->train_tree_json && agent->train_tree_json[0]) {
+        // Check if tree has states
+        cJSON *tree = cJSON_Parse(agent->train_tree_json);
+        cJSON *states = tree ? cJSON_GetObjectItem(tree, "states") : NULL;
+        if (states && cJSON_IsArray(states) && cJSON_GetArraySize(states) > 0) {
+            cJSON_AddStringToObject(root, "play_mode", "tree");
+        } else if (agent->game_rules && agent->game_rules[0]) {
+            cJSON_AddStringToObject(root, "play_mode", "rules");
+        } else {
+            cJSON_AddStringToObject(root, "play_mode", "none");
+        }
+        cJSON_Delete(tree);
+    } else if (agent->game_rules && agent->game_rules[0]) {
+        cJSON_AddStringToObject(root, "play_mode", "rules");
+    } else {
+        cJSON_AddStringToObject(root, "play_mode", "none");
+    }
+
     // Config (mask API key)
     const char *api_key = agent->config.api_key;
     if (api_key && strlen(api_key) > 8) {
@@ -533,6 +552,43 @@ handle_event(struct mg_connection *c, int ev, void *ev_data) {
                 && mg_match(hm->uri, mg_str("/api/train/sessions"), NULL)) {
             cJSON *sessions = sc_ai_agent_list_sessions();
             send_json_response(c, sessions);
+            return;
+        }
+
+        // POST /api/train/session/delete
+        if (mg_match(hm->method, mg_str("POST"), NULL)
+                && mg_match(hm->uri,
+                    mg_str("/api/train/session/delete"), NULL)) {
+            cJSON *body = parse_body(hm);
+            if (!body) {
+                send_error(c, 400, "invalid json");
+                return;
+            }
+            cJSON *jname = cJSON_GetObjectItem(body, "name");
+            if (!cJSON_IsString(jname) || !jname->valuestring[0]) {
+                cJSON_Delete(body);
+                send_error(c, 400, "missing name");
+                return;
+            }
+            // Path traversal protection
+            const char *name = jname->valuestring;
+            if (strchr(name, '/') || strchr(name, '\\')
+                    || strstr(name, "..")) {
+                cJSON_Delete(body);
+                send_error(c, 400, "invalid name");
+                return;
+            }
+            const char *home = getenv("HOME");
+            char path[512];
+            snprintf(path, sizeof(path), "%s/scrcpy_records/%s",
+                     home ? home : "/tmp", name);
+            char cmd[600];
+            snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", path);
+            int ret = system(cmd);
+            (void) ret;
+            LOGI("Train: deleted session %s", name);
+            cJSON_Delete(body);
+            send_ok(c);
             return;
         }
 

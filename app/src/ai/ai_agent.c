@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <SDL2/SDL.h>
 #include <libavutil/frame.h>
@@ -780,6 +782,270 @@ worker_thread_fn(void *data) {
     return 0;
 }
 
+// Call VLM to match screenshot against known states in the tree.
+// Returns the matched state label (caller frees), or NULL if no match.
+static char *
+match_state_with_vlm(struct sc_ai_agent *agent,
+                     const char *base64_data,
+                     uint16_t width, uint16_t height,
+                     cJSON *states_array) {
+    sc_mutex_lock(&agent->mutex);
+    char *api_key = agent->config.api_key
+                    ? strdup(agent->config.api_key) : NULL;
+    char *vision_model = agent->vision_model
+                         ? strdup(agent->vision_model) : NULL;
+    char *base_url = agent->config.base_url
+                     ? strdup(agent->config.base_url) : NULL;
+    sc_mutex_unlock(&agent->mutex);
+
+    if (!api_key || !vision_model) {
+        free(api_key);
+        free(vision_model);
+        free(base_url);
+        return NULL;
+    }
+
+    struct sc_openrouter_config vlm_config = {
+        .api_key = api_key,
+        .model = vision_model,
+        .base_url = base_url,
+    };
+
+    // Build state list text
+    size_t list_cap = 2048;
+    char *state_list = malloc(list_cap);
+    if (!state_list) {
+        free(api_key);
+        free(vision_model);
+        free(base_url);
+        return NULL;
+    }
+    size_t list_len = 0;
+    int num = 1;
+    cJSON *state_item;
+    cJSON_ArrayForEach(state_item, states_array) {
+        cJSON *label = cJSON_GetObjectItem(state_item, "label");
+        if (!label || !cJSON_IsString(label)) continue;
+        int written = snprintf(state_list + list_len, list_cap - list_len,
+                               "%d. %s\n", num++, label->valuestring);
+        list_len += (size_t)written;
+        if (list_len + 256 >= list_cap) {
+            list_cap *= 2;
+            char *tmp = realloc(state_list, list_cap);
+            if (!tmp) break;
+            state_list = tmp;
+        }
+    }
+    state_list[list_len] = '\0';
+
+    // Build VLM prompt
+    char sys_prompt[4096];
+    snprintf(sys_prompt, sizeof(sys_prompt),
+        "You are matching a game screenshot to known states. "
+        "The possible states are:\n%s\n"
+        "Reply with ONLY the state label that best matches the screenshot. "
+        "If none match, reply UNKNOWN. "
+        "Do NOT add any explanation, punctuation, or extra text.",
+        state_list);
+    free(state_list);
+
+    struct sc_ai_message_list vlm_msgs;
+    sc_ai_message_list_init(&vlm_msgs);
+    sc_ai_message_list_push(&vlm_msgs, "system", sys_prompt);
+
+    char text[128];
+    snprintf(text, sizeof(text), "Screenshot %dx%d", width, height);
+    sc_ai_message_list_push_image(&vlm_msgs, text, base64_data);
+
+    LOGI("AI Tree: matching screen against %d states with %s",
+         num - 1, vision_model);
+
+    struct sc_openrouter_response resp =
+        sc_openrouter_chat(&vlm_config, &vlm_msgs, NULL);
+
+    sc_ai_message_list_destroy(&vlm_msgs);
+    free(api_key);
+    free(vision_model);
+    free(base_url);
+
+    if (!resp.success || !resp.content) {
+        LOGW("AI Tree: VLM match failed: %s",
+             resp.error ? resp.error : "unknown");
+        sc_openrouter_response_destroy(&resp);
+        return NULL;
+    }
+
+    // Trim whitespace from response
+    char *result = strdup(resp.content);
+    sc_openrouter_response_destroy(&resp);
+
+    if (result) {
+        // Trim leading/trailing whitespace
+        char *start = result;
+        while (*start == ' ' || *start == '\t' || *start == '\n'
+               || *start == '\r') start++;
+        char *end = start + strlen(start) - 1;
+        while (end > start && (*end == ' ' || *end == '\t'
+               || *end == '\n' || *end == '\r')) end--;
+        *(end + 1) = '\0';
+        if (start != result) {
+            char *trimmed = strdup(start);
+            free(result);
+            result = trimmed;
+        }
+    }
+
+    LOGI("AI Tree: VLM matched state: '%s'", result ? result : "(null)");
+    return result;
+}
+
+// Run one cycle of tree-based auto-play.
+// Returns true if an action was executed, false otherwise.
+static bool
+tree_auto_cycle(struct sc_ai_agent *agent, cJSON *tree) {
+    cJSON *states = cJSON_GetObjectItem(tree, "states");
+    if (!states || !cJSON_IsArray(states)
+            || cJSON_GetArraySize(states) == 0) {
+        return false;
+    }
+
+    // 1. Capture screenshot
+    AVFrame *frame = av_frame_alloc();
+    if (!frame) {
+        LOGE("AI Tree: could not allocate frame");
+        return false;
+    }
+
+    bool has_frame = sc_ai_frame_sink_consume(agent->frame_sink, frame);
+    if (!has_frame) {
+        LOGW("AI Tree: no frame available");
+        av_frame_free(&frame);
+        return false;
+    }
+
+    struct sc_ai_screenshot ss = {0};
+    if (!sc_ai_screenshot_encode(&ss, frame)) {
+        LOGW("AI Tree: screenshot encode failed");
+        av_frame_free(&frame);
+        return false;
+    }
+    av_frame_free(&frame);
+
+    // Update screen dimensions
+    sc_mutex_lock(&agent->mutex);
+    agent->screen_width = ss.width;
+    agent->screen_height = ss.height;
+    sc_ai_tools_set_screen_size(&agent->tools, ss.width, ss.height);
+    sc_mutex_unlock(&agent->mutex);
+
+    // 2. Match state via VLM
+    char *matched_label = match_state_with_vlm(
+        agent, ss.base64_data, ss.width, ss.height, states);
+
+    sc_ai_screenshot_destroy(&ss);
+
+    if (!matched_label || strcmp(matched_label, "UNKNOWN") == 0) {
+        LOGW("AI Tree: no matching state found");
+        // Log to UI
+        sc_mutex_lock(&agent->mutex);
+        sc_ai_message_list_push(&agent->messages, "assistant",
+            "[Tree] No matching state - waiting...");
+        sc_mutex_unlock(&agent->mutex);
+        free(matched_label);
+        return false;
+    }
+
+    // 3. Find matching state in tree
+    cJSON *matched_state = NULL;
+    cJSON *state_item;
+    cJSON_ArrayForEach(state_item, states) {
+        cJSON *label = cJSON_GetObjectItem(state_item, "label");
+        if (label && cJSON_IsString(label)
+                && strcmp(label->valuestring, matched_label) == 0) {
+            matched_state = state_item;
+            break;
+        }
+    }
+
+    if (!matched_state) {
+        // Try partial/fuzzy match: check if VLM response contains a label
+        cJSON_ArrayForEach(state_item, states) {
+            cJSON *label = cJSON_GetObjectItem(state_item, "label");
+            if (label && cJSON_IsString(label)
+                    && strstr(matched_label, label->valuestring)) {
+                matched_state = state_item;
+                break;
+            }
+        }
+    }
+
+    if (!matched_state) {
+        LOGW("AI Tree: VLM returned '%s' but no matching state in tree",
+             matched_label);
+        sc_mutex_lock(&agent->mutex);
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "[Tree] VLM returned '%s' - no matching state", matched_label);
+        sc_ai_message_list_push(&agent->messages, "assistant", msg);
+        sc_mutex_unlock(&agent->mutex);
+        free(matched_label);
+        return false;
+    }
+
+    // 4. Get first action and execute it
+    cJSON *actions = cJSON_GetObjectItem(matched_state, "actions");
+    if (!actions || !cJSON_IsArray(actions)
+            || cJSON_GetArraySize(actions) == 0) {
+        LOGW("AI Tree: state '%s' has no actions", matched_label);
+        sc_mutex_lock(&agent->mutex);
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "[Tree] Matched: %s - no actions defined", matched_label);
+        sc_ai_message_list_push(&agent->messages, "assistant", msg);
+        sc_mutex_unlock(&agent->mutex);
+        free(matched_label);
+        return false;
+    }
+
+    cJSON *action = cJSON_GetArrayItem(actions, 0);
+    cJSON *ax = cJSON_GetObjectItem(action, "x");
+    cJSON *ay = cJSON_GetObjectItem(action, "y");
+    if (!ax || !ay) {
+        free(matched_label);
+        return false;
+    }
+
+    int tap_x = ax->valueint;
+    int tap_y = ay->valueint;
+    cJSON *adesc = cJSON_GetObjectItem(action, "description");
+    const char *desc = (adesc && cJSON_IsString(adesc))
+                       ? adesc->valuestring : "";
+
+    // Execute touch via sc_ai_tools_execute
+    char args_json[128];
+    snprintf(args_json, sizeof(args_json),
+             "{\"x\":%d,\"y\":%d}", tap_x, tap_y);
+
+    LOGI("AI Tree: Matched '%s' -> tap (%d,%d) %s",
+         matched_label, tap_x, tap_y, desc);
+
+    char *result = sc_ai_tools_execute(
+        &agent->tools, "position_click", args_json);
+    free(result);
+
+    // 5. Log to UI
+    sc_mutex_lock(&agent->mutex);
+    char log_msg[512];
+    snprintf(log_msg, sizeof(log_msg),
+             "[Tree] Matched: %s -> tap (%d,%d) %s",
+             matched_label, tap_x, tap_y, desc);
+    sc_ai_message_list_push(&agent->messages, "assistant", log_msg);
+    sc_mutex_unlock(&agent->mutex);
+
+    free(matched_label);
+    return true;
+}
+
 static int
 auto_thread_fn(void *data) {
     struct sc_ai_agent *agent = data;
@@ -795,7 +1061,25 @@ auto_thread_fn(void *data) {
         bool running = agent->auto_running;
         bool has_rules = agent->game_rules && agent->game_rules[0] != '\0';
         char *rules_copy = NULL;
-        if (running && has_rules && !rules_sent) {
+
+        // Check for tree mode
+        bool tree_mode = false;
+        char *tree_json_copy = NULL;
+        if (running && agent->train_tree_json
+                && agent->train_tree_json[0]) {
+            // Quick check: parse and see if it has states
+            cJSON *tree_check = cJSON_Parse(agent->train_tree_json);
+            cJSON *states_check = tree_check
+                ? cJSON_GetObjectItem(tree_check, "states") : NULL;
+            if (states_check && cJSON_IsArray(states_check)
+                    && cJSON_GetArraySize(states_check) > 0) {
+                tree_mode = true;
+                tree_json_copy = strdup(agent->train_tree_json);
+            }
+            cJSON_Delete(tree_check);
+        }
+
+        if (running && has_rules && !rules_sent && !tree_mode) {
             rules_copy = strdup(agent->game_rules);
         }
         sc_mutex_unlock(&agent->mutex);
@@ -806,6 +1090,23 @@ auto_thread_fn(void *data) {
             continue;
         }
 
+        // ============ TREE MODE ============
+        if (tree_mode && tree_json_copy) {
+            cJSON *tree = cJSON_Parse(tree_json_copy);
+            free(tree_json_copy);
+
+            if (tree) {
+                tree_auto_cycle(agent, tree);
+                cJSON_Delete(tree);
+            }
+
+            // Wait before next cycle
+            SDL_Delay(2000);
+            continue;
+        }
+        free(tree_json_copy); // if not tree_mode
+
+        // ============ RULES MODE (existing LLM-based) ============
         // Build prompt: rules on first run, short continuation after
         char *prompt;
         if (rules_copy) {
@@ -1616,4 +1917,36 @@ sc_ai_agent_get_train_tree(struct sc_ai_agent *agent) {
     char *copy = agent->train_tree_json ? strdup(agent->train_tree_json) : NULL;
     sc_mutex_unlock(&agent->mutex);
     return copy;
+}
+
+char *
+sc_ai_agent_match_state(struct sc_ai_agent *agent,
+                        const char *base64_data,
+                        uint16_t width, uint16_t height) {
+    sc_mutex_lock(&agent->mutex);
+    char *tree_json = agent->train_tree_json
+                      ? strdup(agent->train_tree_json) : NULL;
+    sc_mutex_unlock(&agent->mutex);
+
+    if (!tree_json) {
+        return strdup("UNKNOWN");
+    }
+
+    cJSON *tree = cJSON_Parse(tree_json);
+    free(tree_json);
+    if (!tree) {
+        return strdup("UNKNOWN");
+    }
+
+    cJSON *states = cJSON_GetObjectItem(tree, "states");
+    if (!states || !cJSON_IsArray(states)
+            || cJSON_GetArraySize(states) == 0) {
+        cJSON_Delete(tree);
+        return strdup("UNKNOWN");
+    }
+
+    char *result = match_state_with_vlm(agent, base64_data,
+                                         width, height, states);
+    cJSON_Delete(tree);
+    return result ? result : strdup("UNKNOWN");
 }
