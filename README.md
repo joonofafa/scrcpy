@@ -1,12 +1,74 @@
-**This GitHub repo (<https://github.com/Genymobile/scrcpy>) is the only official
-source for the project. Do not download releases from random websites, even if
-their name contains `scrcpy`.**
+**This is a fork of [scrcpy](https://github.com/Genymobile/scrcpy) with AI agent
+and web remote control features added.**
 
-# scrcpy (v3.3.4)
+# scrcpy-ai (based on v3.3.4)
 
 <img src="app/data/icon.svg" width="128" height="128" alt="scrcpy" align="right" />
 
-_pronounced "**scr**een **c**o**py**"_
+_scrcpy + AI Vision Agent + Web Remote Control_
+
+This fork extends scrcpy with:
+
+- **AI Vision Agent** — LLM이 Android 화면을 분석하고 자율적으로 터치/키 조작
+- **Web Remote Control** — 웹 브라우저에서 실시간 화면 스트리밍 + 원격 터치 제어
+- **CLIP Matching** — 화면 임베딩 기반 유사도 매칭으로 게임/앱 자동화
+- **Record/Train/Play** — 조작 시퀀스 녹화 → 학습 → 자동 재생 파이프라인
+
+## Fork Features
+
+### AI Vision Agent
+
+OpenRouter API를 통해 VLM(Vision Language Model)이 Android 화면을 보고 판단·조작합니다.
+
+- Function Calling 기반 도구 실행 (터치, 스와이프, 키 입력, 텍스트 입력, 대기)
+- Tree-based 자동화: 조건 분기로 복잡한 시나리오 구성
+- CLIP 임베딩 매칭으로 화면 상태 인식
+
+### Web Remote Control
+
+헤드리스 서버에서 실행하고 웹 브라우저로 원격 제어합니다.
+
+```
+브라우저 (HTTPS) → Apache Reverse Proxy
+  ├─ /ws/video, /ws/control → C 백엔드 (Mongoose, 포트 18080)
+  └─ / (나머지)             → Python FastAPI (포트 8080)
+```
+
+- H.264 실시간 스트리밍 (jmuxer.js → MSE 브라우저 HW 디코딩)
+- 키프레임 캐싱으로 빠른 초기 로딩
+- SPS/PPS 변경 시 자동 캐시 무효화 (앱 전환 안전성)
+- jmuxer 에러 자동 복구 (buffer error 시 재초기화)
+- 터치/키 WebSocket 원격 입력
+
+### 실행 예시
+
+```bash
+# 헤드리스 웹 서버 모드
+scrcpy --no-window --no-audio --ai-panel --ai-web-port 18080 \
+  --video-bit-rate=4M --video-codec-options=i-frame-interval=2 \
+  --max-size=1280 -s <device-serial>
+```
+
+### 추가 CLI 옵션
+
+| 옵션 | 설명 |
+|------|------|
+| `--ai-panel` | AI 에이전트 + 웹 서버 기능 활성화 |
+| `--ai-web-port <port>` | 웹 서버 포트 (기본: 18080) |
+| `--ai-api-key <key>` | OpenRouter API 키 |
+
+### 추가 빌드 의존성
+
+| 라이브러리 | 용도 |
+|-----------|------|
+| libcurl | AI API + CLIP 서버 HTTP 통신 |
+| libswscale | 스크린샷 이미지 스케일링 |
+
+빌드 시 `meson_options.txt`에서 `ai_panel=true` 설정 필요.
+
+---
+
+## Original scrcpy
 
 This application mirrors Android devices (video and audio) connected via USB or
 [TCP/IP](doc/connection.md#tcpip-wireless) and allows control using the
