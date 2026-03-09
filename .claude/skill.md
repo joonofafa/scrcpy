@@ -18,7 +18,7 @@
 - **Gradle** — Java 서버 빌드
 - **pip** — Python 패키지 (`app/python/pyproject.toml`)
 - 증분 빌드: `ninja -C release/work/build-linux-x86_64`
-- 빌드 옵션: `meson_options.txt` (`ai_panel`, `v4l2`, `usb`, `portable`, `static`)
+- 빌드 옵션: `meson_options.txt` (`webroute`, `v4l2`, `usb`, `portable`, `static`)
 
 ## 핵심 라이브러리
 
@@ -31,13 +31,12 @@
 | libusb-1.0 | (선택) | USB AOA 프로토콜 |
 | libavdevice | (선택) | V4L2 가상 웹캠 |
 
-### 추가 (AI/웹 기능) — C
+### 추가 (웹 라우트) — C
 
 | 라이브러리 | 버전 | 용도 | 경로 |
 |-----------|------|------|------|
 | Mongoose | 7.20 | HTTP/WebSocket 서버 | app/deps/mongoose/ |
 | cJSON | — | JSON 파싱 (API 요청/응답, WebSocket 메시지) | app/deps/cjson/ |
-| libcurl | 시스템 | OpenRouter API + CLIP 서버 HTTP 클라이언트 | 시스템 패키지 |
 | libswscale | 시스템 | 스크린샷 이미지 스케일링 | 시스템 패키지 |
 
 ### 추가 (프론트엔드) — Python
@@ -71,7 +70,7 @@
 - **Producer-Consumer 링버퍼** — 디먹서 스레드 → 웹 서버 스레드 (web_video_sink)
 - **키프레임 캐싱** — 마지막 IDR 프레임 캐시, 새 WS 클라이언트 접속 시 즉시 전송
 - **SPS/PPS 변경 감지** — config 변경 시 키프레임 캐시 무효화 (앱 전환 안전성)
-- **Function Calling** — LLM tool_calls → `sc_ai_tools_execute()` → 터치/키/스와이프 실행
+- **C/Python 역할 분리** — C는 디바이스 I/O만 (/internal/* API), AI는 Python만
 - **싱글 스레드 이벤트 루프** — Mongoose mg_mgr_poll (HTTP + WebSocket + 비디오 브로드캐스트)
 - **리버스 프록시 분리** — Apache가 WebSocket은 C 백엔드로, HTTP는 Python으로 라우팅
 
@@ -97,21 +96,16 @@
 | Controller | 제어 메시지 큐 → 서버 전송 |
 | Receiver | 서버 → 클라이언트 메시지 수신 |
 | Web Server | Mongoose 이벤트 루프 (HTTP/WS 서빙 + 비디오 브로드캐스트) |
-| AI Worker | LLM API 호출 + tool 실행 |
-| AI Auto-play | 주기적 자동 스크린샷 → LLM 분석 → 조작 |
 
 ## 디렉토리 구조 (커스텀 부분)
 
 ```
 app/src/ai/
-├── ai_agent.c/h           # AI 에이전트 코어 (대화, LLM, CLIP 매칭, tree 자동화)
-├── ai_frame_sink.c/h      # 디코딩된 프레임 → PNG 캡처
-├── ai_tools.c/h           # Function calling 도구 (터치, 키, 스와이프 등)
-├── openrouter.c/h         # OpenRouter API 클라이언트
-├── screenshot.c/h         # AVFrame → PNG 인코딩
-├── web_server.c/h         # Mongoose HTTP/WebSocket 서버 + CLIP API
+├── web_server.c/h         # Mongoose HTTP/WebSocket 서버 (/internal/* + /ws/*)
 ├── web_video_sink.c/h     # sc_packet_sink → 링버퍼 → Annex-B + 키프레임 캐시
-└── web_ui.h               # 레거시 웹 UI (C 임베딩)
+├── web_frame_sink.c/h     # 디코딩된 프레임 → 버퍼 (스크린샷용)
+├── web_tools.c/h          # 터치/키/스와이프 주입
+└── screenshot.c/h         # AVFrame → JPEG 인코딩
 
 app/python/scrcpy_ai/
 ├── main.py                # FastAPI 앱 진입점

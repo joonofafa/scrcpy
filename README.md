@@ -43,8 +43,8 @@ OpenRouter API를 통해 VLM(Vision Language Model)이 Android 화면을 보고 
 ### 실행 예시
 
 ```bash
-# 헤드리스 웹 서버 모드
-scrcpy --no-window --no-audio --ai-panel --ai-web-port 18080 \
+# 헤드리스 웹 라우트 서버 모드
+scrcpy --no-window --no-audio --webroute 18080 \
   --video-bit-rate=4M --video-codec-options=i-frame-interval=2 \
   --max-size=1280 -s <device-serial>
 ```
@@ -53,18 +53,15 @@ scrcpy --no-window --no-audio --ai-panel --ai-web-port 18080 \
 
 | 옵션 | 설명 |
 |------|------|
-| `--ai-panel` | AI 에이전트 + 웹 서버 기능 활성화 |
-| `--ai-web-port <port>` | 웹 서버 포트 (기본: 18080) |
-| `--ai-api-key <key>` | OpenRouter API 키 |
+| `--webroute <port>` | 웹 라우트 API 서버 활성화 (비디오 스트림 + 디바이스 제어) |
 
 ### 추가 빌드 의존성
 
 | 라이브러리 | 용도 |
 |-----------|------|
-| libcurl | AI API + CLIP 서버 HTTP 통신 |
 | libswscale | 스크린샷 이미지 스케일링 |
 
-빌드 시 `meson_options.txt`에서 `ai_panel=true` 설정 필요.
+빌드 시 `meson_options.txt`에서 `webroute=true` 설정 필요.
 
 ---
 

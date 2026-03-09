@@ -113,13 +113,8 @@ const struct scrcpy_options scrcpy_options_default = {
     .angle = NULL,
     .vd_destroy_content = true,
     .vd_system_decorations = true,
-#ifdef HAVE_AI_PANEL
-    .ai_panel = false,
-    .ai_api_key = NULL,
-    .ai_model = NULL,
-    .ai_base_url = NULL,
-    .ai_vision_model = NULL,
-    .ai_web_port = 18080,
+#ifdef HAVE_WEB_ROUTE
+    .webroute_port = 0,
 #endif
 };
 

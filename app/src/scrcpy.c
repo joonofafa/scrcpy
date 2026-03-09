@@ -44,11 +44,11 @@
 #ifdef HAVE_V4L2
 # include "v4l2_sink.h"
 #endif
-#ifdef HAVE_AI_PANEL
-# include "ai/ai_agent.h"
-# include "ai/ai_frame_sink.h"
-# include "ai/web_server.h"
-# include "ai/web_video_sink.h"
+#ifdef HAVE_WEB_ROUTE
+# include "web/web_frame_sink.h"
+# include "web/web_tools.h"
+# include "web/web_server.h"
+# include "web/web_video_sink.h"
 #endif
 
 struct scrcpy {
@@ -65,9 +65,9 @@ struct scrcpy {
     struct sc_v4l2_sink v4l2_sink;
     struct sc_delay_buffer v4l2_buffer;
 #endif
-#ifdef HAVE_AI_PANEL
-    struct sc_ai_frame_sink ai_frame_sink;
-    struct sc_ai_agent ai_agent;
+#ifdef HAVE_WEB_ROUTE
+    struct sc_web_frame_sink web_frame_sink;
+    struct sc_web_tools web_tools;
     struct sc_web_server web_server;
     struct sc_web_video_sink web_video_sink;
 #endif
@@ -418,10 +418,8 @@ scrcpy(struct scrcpy_options *options) {
 #ifdef HAVE_V4L2
     bool v4l2_sink_initialized = false;
 #endif
-#ifdef HAVE_AI_PANEL
-    bool ai_frame_sink_initialized = false;
-    bool ai_agent_initialized = false;
-    bool ai_agent_started = false;
+#ifdef HAVE_WEB_ROUTE
+    bool web_frame_sink_initialized = false;
     bool web_server_initialized = false;
     bool web_server_started = false;
     bool web_video_sink_initialized = false;
@@ -617,8 +615,8 @@ scrcpy(struct scrcpy_options *options) {
 #ifdef HAVE_V4L2
     needs_video_decoder |= !!options->v4l2_device;
 #endif
-#ifdef HAVE_AI_PANEL
-    needs_video_decoder |= options->ai_panel;
+#ifdef HAVE_WEB_ROUTE
+    needs_video_decoder |= !!options->webroute_port;
 #endif
     if (needs_video_decoder) {
         sc_decoder_init(&s->video_decoder, "video");
@@ -896,66 +894,38 @@ aoa_complete:
     }
 #endif
 
-#ifdef HAVE_AI_PANEL
-    if (options->ai_panel && options->video && options->control) {
-        if (!sc_ai_frame_sink_init(&s->ai_frame_sink)) {
-            LOGE("Could not initialize AI frame sink");
+#ifdef HAVE_WEB_ROUTE
+    if (options->webroute_port && options->video && options->control) {
+        // Init frame sink
+        if (!sc_web_frame_sink_init(&s->web_frame_sink)) {
+            LOGE("Could not initialize web frame sink");
             goto end;
         }
-        ai_frame_sink_initialized = true;
-
+        web_frame_sink_initialized = true;
         sc_frame_source_add_sink(&s->video_decoder.frame_source,
-                                  &s->ai_frame_sink.frame_sink);
+                                  &s->web_frame_sink.frame_sink);
 
-        struct sc_ai_agent_params ai_params = {
-            .frame_sink = &s->ai_frame_sink,
-            .controller = controller,
-            .api_key = options->ai_api_key,
-            .model = options->ai_model,
-            .base_url = options->ai_base_url,
-            .vision_model = options->ai_vision_model,
-        };
+        // Init tools
+        sc_web_tools_init(&s->web_tools, controller, 0, 0);
 
-        if (!sc_ai_agent_init(&s->ai_agent, &ai_params)) {
-            LOGE("Could not initialize AI agent");
-            goto end;
+        // Init video sink
+        if (sc_web_video_sink_init(&s->web_video_sink)) {
+            web_video_sink_initialized = true;
+            sc_packet_source_add_sink(&s->video_demuxer.packet_source,
+                                      &s->web_video_sink.packet_sink);
+        } else {
+            LOGW("Could not initialize web video sink");
         }
-        ai_agent_initialized = true;
 
-        if (!sc_ai_agent_start(&s->ai_agent)) {
-            LOGE("Could not start AI agent");
-            goto end;
-        }
-        ai_agent_started = true;
-
-        LOGI("AI agent enabled");
-
-        if (options->ai_web_port) {
-            // Initialize web video sink for streaming H.264 to browser
-            if (options->video) {
-                if (sc_web_video_sink_init(&s->web_video_sink)) {
-                    web_video_sink_initialized = true;
-                    sc_packet_source_add_sink(
-                        &s->video_demuxer.packet_source,
-                        &s->web_video_sink.packet_sink);
-                } else {
-                    LOGW("Could not initialize web video sink");
-                }
-            }
-
-            struct sc_web_video_sink *vs =
-                web_video_sink_initialized ? &s->web_video_sink : NULL;
-            if (!sc_web_server_init(&s->web_server, &s->ai_agent,
-                                    vs, controller,
-                                    options->ai_web_port)) {
-                LOGW("Could not initialize web server");
-            } else {
-                web_server_initialized = true;
-                if (!sc_web_server_start(&s->web_server)) {
-                    LOGW("Could not start web server");
-                } else {
-                    web_server_started = true;
-                }
+        // Init web server
+        struct sc_web_video_sink *vs =
+            web_video_sink_initialized ? &s->web_video_sink : NULL;
+        if (sc_web_server_init(&s->web_server, vs, &s->web_frame_sink,
+                                &s->web_tools, controller,
+                                options->webroute_port)) {
+            web_server_initialized = true;
+            if (sc_web_server_start(&s->web_server)) {
+                web_server_started = true;
             }
         }
     }
@@ -1047,15 +1017,12 @@ aoa_complete:
     }
 
 end:
-#ifdef HAVE_AI_PANEL
+#ifdef HAVE_WEB_ROUTE
     if (web_server_started) {
         sc_web_server_stop(&s->web_server);
     }
     if (web_video_sink_initialized) {
         sc_web_video_sink_stop(&s->web_video_sink);
-    }
-    if (ai_agent_started) {
-        sc_ai_agent_stop(&s->ai_agent);
     }
 #endif
 
@@ -1161,7 +1128,7 @@ end:
         sc_file_pusher_destroy(&s->file_pusher);
     }
 
-#ifdef HAVE_AI_PANEL
+#ifdef HAVE_WEB_ROUTE
     if (web_server_started) {
         sc_web_server_join(&s->web_server);
     }
@@ -1171,14 +1138,8 @@ end:
     if (web_video_sink_initialized) {
         sc_web_video_sink_destroy(&s->web_video_sink);
     }
-    if (ai_agent_started) {
-        sc_ai_agent_join(&s->ai_agent);
-    }
-    if (ai_agent_initialized) {
-        sc_ai_agent_destroy(&s->ai_agent);
-    }
-    if (ai_frame_sink_initialized) {
-        sc_ai_frame_sink_destroy(&s->ai_frame_sink);
+    if (web_frame_sink_initialized) {
+        sc_web_frame_sink_destroy(&s->web_frame_sink);
     }
 #endif
 

@@ -327,13 +327,8 @@ struct scrcpy_options {
     const char *start_app;
     bool vd_destroy_content;
     bool vd_system_decorations;
-#ifdef HAVE_AI_PANEL
-    bool ai_panel;
-    const char *ai_api_key;
-    const char *ai_model;
-    const char *ai_base_url;
-    const char *ai_vision_model;
-    uint16_t ai_web_port;
+#ifdef HAVE_WEB_ROUTE
+    uint16_t webroute_port;
 #endif
 };
 

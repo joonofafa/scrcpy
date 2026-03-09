@@ -14,7 +14,7 @@
 #define AI_SCREENSHOT_MAX_DIM 1280
 
 bool
-sc_ai_screenshot_encode(struct sc_ai_screenshot *ss, const AVFrame *frame) {
+sc_web_screenshot_encode(struct sc_web_screenshot *ss, const AVFrame *frame) {
     ss->png_data = NULL;
     ss->base64_data = NULL;
     ss->png_size = 0;
@@ -36,7 +36,7 @@ sc_ai_screenshot_encode(struct sc_ai_screenshot *ss, const AVFrame *frame) {
         dst_h = (dst_h + 1) & ~1;
         if (dst_w < 2) dst_w = 2;
         if (dst_h < 2) dst_h = 2;
-        LOGI("AI screenshot: downscale %dx%d -> %dx%d",
+        LOGI("Web screenshot: downscale %dx%d -> %dx%d",
              src_w, src_h, dst_w, dst_h);
     }
 
@@ -156,7 +156,7 @@ free_enc:
 }
 
 void
-sc_ai_screenshot_destroy(struct sc_ai_screenshot *ss) {
+sc_web_screenshot_destroy(struct sc_web_screenshot *ss) {
     free(ss->png_data);
     ss->png_data = NULL;
     free(ss->base64_data);

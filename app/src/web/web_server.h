@@ -9,26 +9,31 @@
 #include "mongoose.h"
 #include "util/thread.h"
 
-struct sc_ai_agent;
 struct sc_web_video_sink;
 struct sc_controller;
+struct sc_web_frame_sink;
+struct sc_web_tools;
 
 struct sc_web_server {
-    struct sc_ai_agent *agent;
     struct sc_web_video_sink *video_sink;
     struct sc_controller *controller;
+    struct sc_web_frame_sink *frame_sink;
+    struct sc_web_tools *tools;
     struct mg_mgr mgr;
     sc_thread thread;
     bool stopped;
     uint16_t port;
     uint16_t last_video_width;
     uint16_t last_video_height;
+    uint16_t screen_width;
+    uint16_t screen_height;
 };
 
 bool
 sc_web_server_init(struct sc_web_server *server,
-                   struct sc_ai_agent *agent,
                    struct sc_web_video_sink *video_sink,
+                   struct sc_web_frame_sink *frame_sink,
+                   struct sc_web_tools *tools,
                    struct sc_controller *controller,
                    uint16_t port);
 

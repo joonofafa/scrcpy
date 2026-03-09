@@ -114,13 +114,8 @@ enum {
     OPT_NO_VD_SYSTEM_DECORATIONS,
     OPT_NO_VD_DESTROY_CONTENT,
     OPT_DISPLAY_IME_POLICY,
-#ifdef HAVE_AI_PANEL
-    OPT_AI_PANEL,
-    OPT_AI_API_KEY,
-    OPT_AI_MODEL,
-    OPT_AI_BASE_URL,
-    OPT_AI_VISION_MODEL,
-    OPT_AI_WEB_PORT,
+#ifdef HAVE_WEB_ROUTE
+    OPT_WEBROUTE,
 #endif
 };
 
@@ -1071,46 +1066,12 @@ static const struct sc_option options[] = {
         .text = "Set the initial window height.\n"
                 "Default is 0 (automatic).",
     },
-#ifdef HAVE_AI_PANEL
+#ifdef HAVE_WEB_ROUTE
     {
-        .longopt_id = OPT_AI_PANEL,
-        .longopt = "ai-panel",
-        .text = "Enable the AI panel for Vision AI screen analysis and "
-                "automated device control.",
-    },
-    {
-        .longopt_id = OPT_AI_API_KEY,
-        .longopt = "ai-api-key",
-        .argdesc = "key",
-        .text = "Set the API key for the AI service (OpenRouter).",
-    },
-    {
-        .longopt_id = OPT_AI_MODEL,
-        .longopt = "ai-model",
-        .argdesc = "model",
-        .text = "Set the AI model to use.\n"
-                "Default is \"anthropic/claude-sonnet-4\".",
-    },
-    {
-        .longopt_id = OPT_AI_BASE_URL,
-        .longopt = "ai-base-url",
-        .argdesc = "url",
-        .text = "Set the base URL for the AI API.\n"
-                "Default is \"https://openrouter.ai/api/v1\".",
-    },
-    {
-        .longopt_id = OPT_AI_VISION_MODEL,
-        .longopt = "ai-vision-model",
-        .argdesc = "model",
-        .text = "Set the vision model (VLM) for screen analysis.\n"
-                "Default is \"google/gemini-2.5-flash-lite\".",
-    },
-    {
-        .longopt_id = OPT_AI_WEB_PORT,
-        .longopt = "ai-web-port",
+        .longopt_id = OPT_WEBROUTE,
+        .longopt = "webroute",
         .argdesc = "port",
-        .text = "Set the port for the AI web control interface.\n"
-                "Default is 8080. Set to 0 to disable.",
+        .text = "Enable web route API server on the specified port.",
     },
 #endif
 };
@@ -2871,29 +2832,13 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
                     return false;
                 }
                 break;
-#ifdef HAVE_AI_PANEL
-            case OPT_AI_PANEL:
-                opts->ai_panel = true;
-                break;
-            case OPT_AI_API_KEY:
-                opts->ai_api_key = optarg;
-                break;
-            case OPT_AI_MODEL:
-                opts->ai_model = optarg;
-                break;
-            case OPT_AI_BASE_URL:
-                opts->ai_base_url = optarg;
-                break;
-            case OPT_AI_VISION_MODEL:
-                opts->ai_vision_model = optarg;
-                break;
-            case OPT_AI_WEB_PORT: {
-                long val = strtol(optarg, NULL, 0);
-                if (val < 0 || val > 65535) {
-                    LOGE("Invalid web port: %s", optarg);
+#ifdef HAVE_WEB_ROUTE
+            case OPT_WEBROUTE: {
+                uint16_t port;
+                if (!parse_port(optarg, &port)) {
                     return false;
                 }
-                opts->ai_web_port = (uint16_t)val;
+                opts->webroute_port = port;
                 break;
             }
 #endif
@@ -2953,8 +2898,8 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
 
     if (opts->video && !opts->video_playback && !opts->record_filename
             && !v4l2
-#ifdef HAVE_AI_PANEL
-            && !opts->ai_panel
+#ifdef HAVE_WEB_ROUTE
+            && !opts->webroute_port
 #endif
             ) {
         LOGI("No video playback, no recording, no V4L2 sink: video disabled");

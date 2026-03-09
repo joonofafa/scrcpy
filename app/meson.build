@@ -108,21 +108,19 @@ if usb_support
     ]
 endif
 
-ai_panel_support = get_option('ai_panel')
-ai_src = []
-if ai_panel_support
-    ai_src += [
+webroute_support = get_option('webroute')
+webroute_src = []
+if webroute_support
+    webroute_src += [
         'src/util/base64.c',
-        'src/ai/ai_frame_sink.c',
-        'src/ai/screenshot.c',
-        'src/ai/openrouter.c',
-        'src/ai/ai_tools.c',
-        'src/ai/ai_agent.c',
-        'src/ai/web_server.c',
-        'src/ai/web_video_sink.c',
+        'src/web/web_frame_sink.c',
+        'src/web/screenshot.c',
+        'src/web/web_tools.c',
+        'src/web/web_server.c',
+        'src/web/web_video_sink.c',
         'deps/cjson/cJSON.c',
     ]
-    src += ai_src
+    src += webroute_src
 endif
 
 cc = meson.get_compiler('c')
@@ -145,8 +143,7 @@ if usb_support
     dependencies += dependency('libusb-1.0', static: static)
 endif
 
-if ai_panel_support
-    dependencies += dependency('libcurl', static: static)
+if webroute_support
     dependencies += dependency('libswscale', static: static)
 endif
 
@@ -198,32 +195,32 @@ conf.set('HAVE_V4L2', v4l2_support)
 # enable HID over AOA support (linux only)
 conf.set('HAVE_USB', usb_support)
 
-# enable AI panel support
-conf.set('HAVE_AI_PANEL', ai_panel_support)
+# enable web route support
+conf.set('HAVE_WEB_ROUTE', webroute_support)
 
 configure_file(configuration: conf, output: 'config.h')
 
 src_dir = include_directories('src')
 
-ai_inc = []
-if ai_panel_support
-    ai_inc = [include_directories('deps/cjson'), include_directories('deps/mongoose')]
+webroute_inc = []
+if webroute_support
+    webroute_inc = [include_directories('deps/cjson'), include_directories('deps/mongoose')]
 endif
 
-ai_libs = []
-if ai_panel_support
+webroute_libs = []
+if webroute_support
     mongoose_lib = static_library('mongoose',
         'deps/mongoose/mongoose.c',
         c_args: ['-D_GNU_SOURCE', '-w'],
         include_directories: [include_directories('deps/mongoose')],
     )
-    ai_libs = [mongoose_lib]
+    webroute_libs = [mongoose_lib]
 endif
 
 executable('scrcpy', src,
            dependencies: dependencies,
-           include_directories: [src_dir] + ai_inc,
-           link_with: ai_libs,
+           include_directories: [src_dir] + webroute_inc,
+           link_with: webroute_libs,
            install: true,
            c_args: [])
 

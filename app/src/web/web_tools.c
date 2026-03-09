@@ -1,13 +1,10 @@
-#include "ai_tools.h"
+#include "web_tools.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <SDL2/SDL.h>
 #include <libavutil/frame.h>
 
-#include "ai/ai_agent.h"
-#include "ai/ai_frame_sink.h"
-#include "ai/screenshot.h"
 #include "../../deps/cjson/cJSON.h"
 #include "android/input.h"
 #include "android/keycodes.h"
@@ -18,30 +15,25 @@
 #include "util/thread.h"
 
 void
-sc_ai_tools_init(struct sc_ai_tools *tools, struct sc_controller *controller,
-                 uint16_t screen_width, uint16_t screen_height) {
+sc_web_tools_init(struct sc_web_tools *tools, struct sc_controller *controller,
+                  uint16_t screen_width, uint16_t screen_height) {
     tools->controller = controller;
     tools->screen_width = screen_width;
     tools->screen_height = screen_height;
 }
 
 void
-sc_ai_tools_set_screen_size(struct sc_ai_tools *tools,
-                            uint16_t width, uint16_t height) {
+sc_web_tools_set_screen_size(struct sc_web_tools *tools,
+                             uint16_t width, uint16_t height) {
     tools->screen_width = width;
     tools->screen_height = height;
 }
 
 void
-sc_ai_tools_set_frame_size(struct sc_ai_tools *tools,
-                           uint16_t width, uint16_t height) {
+sc_web_tools_set_frame_size(struct sc_web_tools *tools,
+                            uint16_t width, uint16_t height) {
     tools->frame_width = width;
     tools->frame_height = height;
-}
-
-void
-sc_ai_tools_set_agent(struct sc_ai_tools *tools, struct sc_ai_agent *agent) {
-    tools->agent = agent;
 }
 
 static const char TOOLS_JSON[] =
@@ -50,7 +42,7 @@ static const char TOOLS_JSON[] =
 "    \"type\": \"function\","
 "    \"function\": {"
 "      \"name\": \"position_click\","
-"      \"description\": \"Tap at a specific screen position. Optionally pass w,h bounding box — if the tap misses, retry offsets within the box are returned.\","
+"      \"description\": \"Tap at a specific screen position. Optionally pass w,h bounding box -- if the tap misses, retry offsets within the box are returned.\","
 "      \"parameters\": {"
 "        \"type\": \"object\","
 "        \"properties\": {"
@@ -152,23 +144,11 @@ static const char TOOLS_JSON[] =
 "        \"required\": [\"text\"]"
 "      }"
 "    }"
-"  },"
-"  {"
-"    \"type\": \"function\","
-"    \"function\": {"
-"      \"name\": \"screenshot\","
-"      \"description\": \"Take a fresh screenshot of the device screen. Use this after performing actions to verify the result before deciding next steps.\","
-"      \"parameters\": {"
-"        \"type\": \"object\","
-"        \"properties\": {},"
-"        \"required\": []"
-"      }"
-"    }"
 "  }"
 "]";
 
 const char *
-sc_ai_tools_get_definitions(void) {
+sc_web_tools_get_definitions(void) {
     return TOOLS_JSON;
 }
 
@@ -191,7 +171,7 @@ inject_touch(struct sc_controller *controller,
                                        ? 0.0f : 1.0f;
 
     if (!sc_controller_push_msg(controller, &msg)) {
-        LOGW("AI: could not inject touch event");
+        LOGW("Web tool: could not inject touch event");
         return false;
     }
     return true;
@@ -209,7 +189,7 @@ inject_keycode(struct sc_controller *controller,
     msg.inject_keycode.metastate = AMETA_NONE;
 
     if (!sc_controller_push_msg(controller, &msg)) {
-        LOGW("AI: could not inject keycode");
+        LOGW("Web tool: could not inject keycode");
         return false;
     }
     return true;
@@ -218,19 +198,19 @@ inject_keycode(struct sc_controller *controller,
 static void
 clamp_coords(int32_t *x, int32_t *y, uint16_t sw, uint16_t sh) {
     if (*x < 0) {
-        LOGW("AI tool: clamping x=%d to 0", *x);
+        LOGW("Web tool: clamping x=%d to 0", *x);
         *x = 0;
     }
     if (*y < 0) {
-        LOGW("AI tool: clamping y=%d to 0", *y);
+        LOGW("Web tool: clamping y=%d to 0", *y);
         *y = 0;
     }
     if (sw > 0 && *x >= sw) {
-        LOGW("AI tool: clamping x=%d to %d (screen_width)", *x, sw - 1);
+        LOGW("Web tool: clamping x=%d to %d (screen_width)", *x, sw - 1);
         *x = sw - 1;
     }
     if (sh > 0 && *y >= sh) {
-        LOGW("AI tool: clamping y=%d to %d (screen_height)", *y, sh - 1);
+        LOGW("Web tool: clamping y=%d to %d (screen_height)", *y, sh - 1);
         *y = sh - 1;
     }
 }
@@ -263,7 +243,7 @@ map_screen_to_frame(int32_t sx, int32_t sy,
 }
 
 static char *
-tool_position_click(struct sc_ai_tools *tools, cJSON *args) {
+tool_position_click(struct sc_web_tools *tools, cJSON *args) {
     cJSON *jx = cJSON_GetObjectItem(args, "x");
     cJSON *jy = cJSON_GetObjectItem(args, "y");
     if (!jx || !jy) {
@@ -281,18 +261,18 @@ tool_position_click(struct sc_ai_tools *tools, cJSON *args) {
     uint16_t sh = tools->screen_height;
     clamp_coords(&x, &y, sw, sh);
 
-    // Scale from AI screenshot coordinates to original frame coordinates
+    // Scale from screenshot coordinates to original frame coordinates
     uint16_t fw = tools->frame_width ? tools->frame_width : sw;
     uint16_t fh = tools->frame_height ? tools->frame_height : sh;
     int32_t fx;
     int32_t fy;
     if (!map_screen_to_frame(x, y, sw, sh, fw, fh, &fx, &fy)) {
-        LOGW("AI tool: invalid dimensions screen=%ux%u frame=%ux%u",
+        LOGW("Web tool: invalid dimensions screen=%ux%u frame=%ux%u",
              (unsigned) sw, (unsigned) sh, (unsigned) fw, (unsigned) fh);
         return strdup("{\"error\": \"invalid screen/frame dimensions\"}");
     }
 
-    LOGI("AI tool: position_click(%d, %d, box=%dx%d) screen=%dx%d -> "
+    LOGI("Web tool: position_click(%d, %d, box=%dx%d) screen=%dx%d -> "
          "frame(%d, %d) frame=%dx%d",
          x, y, box_w, box_h, sw, sh, fx, fy, fw, fh);
 
@@ -312,10 +292,7 @@ tool_position_click(struct sc_ai_tools *tools, cJSON *args) {
     }
 
     if (ok) {
-        if (tools->agent) {
-            sc_ai_agent_record_touch(tools->agent, x, y);
-        }
-        // If bounding box provided, suggest retry offsets (±25% of box)
+        // If bounding box provided, suggest retry offsets
         if (box_w > 10 && box_h > 10) {
             int32_t ox = box_w / 4;
             int32_t oy = box_h / 4;
@@ -345,7 +322,7 @@ tool_position_click(struct sc_ai_tools *tools, cJSON *args) {
 }
 
 static char *
-tool_position_long_press(struct sc_ai_tools *tools, cJSON *args) {
+tool_position_long_press(struct sc_web_tools *tools, cJSON *args) {
     cJSON *jx = cJSON_GetObjectItem(args, "x");
     cJSON *jy = cJSON_GetObjectItem(args, "y");
     cJSON *jms = cJSON_GetObjectItem(args, "duration_ms");
@@ -360,18 +337,18 @@ tool_position_long_press(struct sc_ai_tools *tools, cJSON *args) {
     uint16_t sh = tools->screen_height;
     clamp_coords(&x, &y, sw, sh);
 
-    // Scale from AI screenshot coordinates to original frame coordinates
+    // Scale from screenshot coordinates to original frame coordinates
     uint16_t fw = tools->frame_width ? tools->frame_width : sw;
     uint16_t fh = tools->frame_height ? tools->frame_height : sh;
     int32_t fx;
     int32_t fy;
     if (!map_screen_to_frame(x, y, sw, sh, fw, fh, &fx, &fy)) {
-        LOGW("AI tool: invalid dimensions screen=%ux%u frame=%ux%u",
+        LOGW("Web tool: invalid dimensions screen=%ux%u frame=%ux%u",
              (unsigned) sw, (unsigned) sh, (unsigned) fw, (unsigned) fh);
         return strdup("{\"error\": \"invalid screen/frame dimensions\"}");
     }
 
-    LOGI("AI tool: position_long_press(%d, %d, %dms) screen=%dx%d -> frame(%d, %d) frame=%dx%d",
+    LOGI("Web tool: position_long_press(%d, %d, %dms) screen=%dx%d -> frame(%d, %d) frame=%dx%d",
          x, y, duration_ms, sw, sh, fx, fy, fw, fh);
 
     bool ok = inject_touch(tools->controller, fw, fh, fx, fy,
@@ -383,9 +360,6 @@ tool_position_long_press(struct sc_ai_tools *tools, cJSON *args) {
     }
 
     if (ok) {
-        if (tools->agent) {
-            sc_ai_agent_record_touch(tools->agent, x, y);
-        }
         char buf[160];
         snprintf(buf, sizeof(buf),
                  "{\"success\":true,\"pressed\":[%d,%d],\"duration_ms\":%d,"
@@ -397,7 +371,7 @@ tool_position_long_press(struct sc_ai_tools *tools, cJSON *args) {
 }
 
 static char *
-tool_swipe(struct sc_ai_tools *tools, cJSON *args) {
+tool_swipe(struct sc_web_tools *tools, cJSON *args) {
     cJSON *jx1 = cJSON_GetObjectItem(args, "x1");
     cJSON *jy1 = cJSON_GetObjectItem(args, "y1");
     cJSON *jx2 = cJSON_GetObjectItem(args, "x2");
@@ -416,7 +390,7 @@ tool_swipe(struct sc_ai_tools *tools, cJSON *args) {
     clamp_coords(&x1, &y1, sw, sh);
     clamp_coords(&x2, &y2, sw, sh);
 
-    // Scale from AI screenshot coordinates to original frame coordinates
+    // Scale from screenshot coordinates to original frame coordinates
     uint16_t fw = tools->frame_width ? tools->frame_width : sw;
     uint16_t fh = tools->frame_height ? tools->frame_height : sh;
     int32_t fx1;
@@ -425,12 +399,12 @@ tool_swipe(struct sc_ai_tools *tools, cJSON *args) {
     int32_t fy2;
     if (!map_screen_to_frame(x1, y1, sw, sh, fw, fh, &fx1, &fy1)
             || !map_screen_to_frame(x2, y2, sw, sh, fw, fh, &fx2, &fy2)) {
-        LOGW("AI tool: invalid dimensions screen=%ux%u frame=%ux%u",
+        LOGW("Web tool: invalid dimensions screen=%ux%u frame=%ux%u",
              (unsigned) sw, (unsigned) sh, (unsigned) fw, (unsigned) fh);
         return strdup("{\"error\": \"invalid screen/frame dimensions\"}");
     }
 
-    LOGI("AI tool: swipe(%d,%d -> %d,%d, %dms) screen=%dx%d -> frame(%d,%d -> %d,%d) frame=%dx%d",
+    LOGI("Web tool: swipe(%d,%d -> %d,%d, %dms) screen=%dx%d -> frame(%d,%d -> %d,%d) frame=%dx%d",
          x1, y1, x2, y2, duration_ms, sw, sh, fx1, fy1, fx2, fy2, fw, fh);
 
     bool ok = inject_touch(tools->controller, fw, fh, fx1, fy1,
@@ -474,14 +448,14 @@ tool_swipe(struct sc_ai_tools *tools, cJSON *args) {
 }
 
 static char *
-tool_key_press(struct sc_ai_tools *tools, cJSON *args) {
+tool_key_press(struct sc_web_tools *tools, cJSON *args) {
     cJSON *jkc = cJSON_GetObjectItem(args, "keycode");
     if (!jkc) {
         return strdup("{\"error\": \"missing keycode\"}");
     }
 
     enum android_keycode kc = (enum android_keycode) jkc->valueint;
-    LOGI("AI tool: key_press(%d)", kc);
+    LOGI("Web tool: key_press(%d)", kc);
 
     bool ok = inject_keycode(tools->controller, kc, AKEY_EVENT_ACTION_DOWN);
     if (ok) {
@@ -498,13 +472,13 @@ tool_key_press(struct sc_ai_tools *tools, cJSON *args) {
 }
 
 static char *
-tool_key_down(struct sc_ai_tools *tools, cJSON *args) {
+tool_key_down(struct sc_web_tools *tools, cJSON *args) {
     cJSON *jkc = cJSON_GetObjectItem(args, "keycode");
     if (!jkc) {
         return strdup("{\"error\": \"missing keycode\"}");
     }
 
-    LOGI("AI tool: key_down(%d)", jkc->valueint);
+    LOGI("Web tool: key_down(%d)", jkc->valueint);
     bool ok = inject_keycode(tools->controller,
                              (enum android_keycode) jkc->valueint,
                              AKEY_EVENT_ACTION_DOWN);
@@ -514,13 +488,13 @@ tool_key_down(struct sc_ai_tools *tools, cJSON *args) {
 }
 
 static char *
-tool_key_up(struct sc_ai_tools *tools, cJSON *args) {
+tool_key_up(struct sc_web_tools *tools, cJSON *args) {
     cJSON *jkc = cJSON_GetObjectItem(args, "keycode");
     if (!jkc) {
         return strdup("{\"error\": \"missing keycode\"}");
     }
 
-    LOGI("AI tool: key_up(%d)", jkc->valueint);
+    LOGI("Web tool: key_up(%d)", jkc->valueint);
     bool ok = inject_keycode(tools->controller,
                              (enum android_keycode) jkc->valueint,
                              AKEY_EVENT_ACTION_UP);
@@ -530,14 +504,14 @@ tool_key_up(struct sc_ai_tools *tools, cJSON *args) {
 }
 
 static char *
-tool_input_text(struct sc_ai_tools *tools, cJSON *args) {
+tool_input_text(struct sc_web_tools *tools, cJSON *args) {
     cJSON *jtext = cJSON_GetObjectItem(args, "text");
     if (!jtext || !jtext->valuestring) {
         return strdup("{\"error\": \"missing text\"}");
     }
 
     const char *text = jtext->valuestring;
-    LOGI("AI tool: input_text(\"%s\")", text);
+    LOGI("Web tool: input_text(\"%s\")", text);
 
     struct sc_control_msg msg;
     msg.type = SC_CONTROL_MSG_TYPE_INJECT_TEXT;
@@ -555,100 +529,10 @@ tool_input_text(struct sc_ai_tools *tools, cJSON *args) {
     return strdup("{\"success\": true}");
 }
 
-static char *
-tool_screenshot(struct sc_ai_tools *tools, cJSON *args) {
-    (void) args;
-
-    if (!tools->agent) {
-        return strdup("{\"error\": \"agent not available\"}");
-    }
-
-    struct sc_ai_agent *agent = tools->agent;
-
-    // Capture fresh screenshot
-    AVFrame *frame = av_frame_alloc();
-    if (!frame) {
-        return strdup("{\"error\": \"could not allocate frame\"}");
-    }
-
-    bool has_screenshot = sc_ai_frame_sink_consume(agent->frame_sink, frame);
-    if (!has_screenshot) {
-        av_frame_free(&frame);
-        return strdup("{\"error\": \"no frame available\"}");
-    }
-
-    uint16_t orig_w = (uint16_t) frame->width;
-    uint16_t orig_h = (uint16_t) frame->height;
-
-    struct sc_ai_screenshot ss = {0};
-    if (!sc_ai_screenshot_encode(&ss, frame)) {
-        av_frame_free(&frame);
-        return strdup("{\"error\": \"screenshot encode failed\"}");
-    }
-    av_frame_free(&frame);
-
-    uint16_t w = ss.width;
-    uint16_t h = ss.height;
-
-    // Analyze screen with VLM
-    char *screen_desc = NULL;
-    bool use_vlm = false;
-
-    sc_mutex_lock(&agent->mutex);
-    use_vlm = agent->vision_model && agent->vision_model[0] != '\0';
-    sc_mutex_unlock(&agent->mutex);
-
-    if (use_vlm) {
-        screen_desc = sc_ai_agent_analyze_screen(agent, ss.base64_data, w, h);
-    }
-
-    // Update agent state
-    sc_mutex_lock(&agent->mutex);
-    free(agent->latest_png_data);
-    agent->latest_png_data = malloc(ss.png_size);
-    if (agent->latest_png_data) {
-        memcpy(agent->latest_png_data, ss.png_data, ss.png_size);
-        agent->latest_png_size = ss.png_size;
-    }
-    agent->screen_width = w;
-    agent->screen_height = h;
-    sc_ai_tools_set_screen_size(tools, w, h);
-    sc_ai_tools_set_frame_size(tools, orig_w, orig_h);
-
-    // Add message: text-only if VLM, image if not
-    char text[4096];
-    if (use_vlm && screen_desc) {
-        snprintf(text, sizeof(text),
-                 "Screenshot %dx%d (fresh)\n"
-                 "=== VLM ANALYSIS (use these EXACT coordinates) ===\n"
-                 "%s\n"
-                 "=== END VLM ANALYSIS ===", w, h,
-                 screen_desc);
-        sc_ai_message_list_push(&agent->messages, "user", text);
-    } else if (screen_desc) {
-        snprintf(text, sizeof(text),
-                 "Screenshot %dx%d (fresh)\n%s", w, h, screen_desc);
-        sc_ai_message_list_push_image(&agent->messages, text, ss.base64_data);
-    } else {
-        snprintf(text, sizeof(text),
-                 "Screenshot %dx%d (fresh)", w, h);
-        sc_ai_message_list_push_image(&agent->messages, text, ss.base64_data);
-    }
-    sc_mutex_unlock(&agent->mutex);
-
-    free(screen_desc);
-    sc_ai_screenshot_destroy(&ss);
-
-    char result[256];
-    snprintf(result, sizeof(result),
-             "{\"success\": true, \"width\": %d, \"height\": %d}", w, h);
-    return strdup(result);
-}
-
 char *
-sc_ai_tools_execute(struct sc_ai_tools *tools,
-                    const char *function_name,
-                    const char *arguments_json) {
+sc_web_tools_execute(struct sc_web_tools *tools,
+                     const char *function_name,
+                     const char *arguments_json) {
     cJSON *args = NULL;
     if (arguments_json && arguments_json[0]) {
         args = cJSON_Parse(arguments_json);
@@ -673,8 +557,6 @@ sc_ai_tools_execute(struct sc_ai_tools *tools,
         result = tool_key_up(tools, args);
     } else if (strcmp(function_name, "input_text") == 0) {
         result = tool_input_text(tools, args);
-    } else if (strcmp(function_name, "screenshot") == 0) {
-        result = tool_screenshot(tools, args);
     } else {
         size_t len = strlen(function_name) + 64;
         result = malloc(len);
@@ -684,7 +566,7 @@ sc_ai_tools_execute(struct sc_ai_tools *tools,
         }
     }
 
-    LOGI("AI tool result: %s(%s) => %s",
+    LOGI("Web tool result: %s(%s) => %s",
          function_name, arguments_json ? arguments_json : "",
          result ? result : "(null)");
 

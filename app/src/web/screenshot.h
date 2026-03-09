@@ -1,5 +1,5 @@
-#ifndef SC_AI_SCREENSHOT_H
-#define SC_AI_SCREENSHOT_H
+#ifndef SC_WEB_SCREENSHOT_H
+#define SC_WEB_SCREENSHOT_H
 
 #include "common.h"
 
@@ -8,7 +8,7 @@
 #include <stdint.h>
 #include <libavutil/frame.h>
 
-struct sc_ai_screenshot {
+struct sc_web_screenshot {
     uint8_t *png_data;
     size_t png_size;
     char *base64_data;
@@ -18,11 +18,11 @@ struct sc_ai_screenshot {
 };
 
 // Encode an AVFrame (YUV420P or any pixel format) to PNG and base64.
-// The caller must call sc_ai_screenshot_destroy() to free resources.
+// The caller must call sc_web_screenshot_destroy() to free resources.
 bool
-sc_ai_screenshot_encode(struct sc_ai_screenshot *ss, const AVFrame *frame);
+sc_web_screenshot_encode(struct sc_web_screenshot *ss, const AVFrame *frame);
 
 void
-sc_ai_screenshot_destroy(struct sc_ai_screenshot *ss);
+sc_web_screenshot_destroy(struct sc_web_screenshot *ss);
 
 #endif

@@ -1,5 +1,5 @@
-#ifndef SC_AI_FRAME_SINK_H
-#define SC_AI_FRAME_SINK_H
+#ifndef SC_WEB_FRAME_SINK_H
+#define SC_WEB_FRAME_SINK_H
 
 #include "common.h"
 
@@ -10,7 +10,7 @@
 #include "trait/frame_sink.h"
 #include "util/thread.h"
 
-struct sc_ai_frame_sink {
+struct sc_web_frame_sink {
     struct sc_frame_sink frame_sink; // frame sink trait
 
     struct sc_frame_buffer fb;
@@ -22,14 +22,14 @@ struct sc_ai_frame_sink {
 };
 
 bool
-sc_ai_frame_sink_init(struct sc_ai_frame_sink *afs);
+sc_web_frame_sink_init(struct sc_web_frame_sink *wfs);
 
 void
-sc_ai_frame_sink_destroy(struct sc_ai_frame_sink *afs);
+sc_web_frame_sink_destroy(struct sc_web_frame_sink *wfs);
 
 // Consume the latest frame. The caller must call av_frame_unref() on dst
 // when done. Returns false if no frame is available.
 bool
-sc_ai_frame_sink_consume(struct sc_ai_frame_sink *afs, AVFrame *dst);
+sc_web_frame_sink_consume(struct sc_web_frame_sink *wfs, AVFrame *dst);
 
 #endif
