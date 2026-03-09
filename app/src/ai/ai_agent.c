@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <SDL2/SDL.h>
+#include <curl/curl.h>
 #include <libavutil/frame.h>
 
 #include "ai/screenshot.h"
@@ -593,12 +595,15 @@ process_prompt(struct sc_ai_agent *agent, const char *prompt) {
 
         // In auto mode: take a fresh screenshot+VLM and continue the loop
         // so LLM can decide the next action without external prompting.
+        // But NOT when CLIP mode is active (CLIP has its own auto cycle).
         sc_mutex_lock(&agent->mutex);
         is_auto = agent->auto_running && !agent->stopped;
+        bool clip_active = agent->clip_embeddings_json
+                           && agent->clip_embeddings_json[0];
         sc_mutex_unlock(&agent->mutex);
 
-        if (!is_auto) {
-            break; // manual mode: done
+        if (!is_auto || clip_active) {
+            break; // manual mode, stopped, or CLIP handles its own loop
         }
 
         consecutive_text++;
@@ -1046,6 +1051,382 @@ tree_auto_cycle(struct sc_ai_agent *agent, cJSON *tree) {
     return true;
 }
 
+// --- CLIP embedding helpers ---
+
+struct clip_buffer {
+    char *data;
+    size_t size;
+};
+
+static size_t
+clip_write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t total = size * nmemb;
+    struct clip_buffer *buf = userp;
+    char *tmp = realloc(buf->data, buf->size + total + 1);
+    if (!tmp) return 0;
+    buf->data = tmp;
+    memcpy(buf->data + buf->size, contents, total);
+    buf->size += total;
+    buf->data[buf->size] = '\0';
+    return total;
+}
+
+// Call CLIP server /embed endpoint. Returns cJSON with "embedding" array, or NULL.
+static cJSON *
+clip_call_embed(struct sc_ai_agent *agent, const char *base64_data) {
+    if (!base64_data) return NULL;
+
+    uint16_t port;
+    sc_mutex_lock(&agent->mutex);
+    port = agent->clip_port;
+    sc_mutex_unlock(&agent->mutex);
+
+    char url[128];
+    snprintf(url, sizeof(url), "http://localhost:%u/embed", (unsigned)port);
+
+    // Build JSON body: {"image_base64": "..."}
+    cJSON *body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "image_base64", base64_data);
+    char *body_str = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!body_str) return NULL;
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        free(body_str);
+        return NULL;
+    }
+
+    struct clip_buffer resp_buf = {0};
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, clip_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_buf);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    free(body_str);
+
+    if (res != CURLE_OK) {
+        LOGW("CLIP: curl error: %s", curl_easy_strerror(res));
+        free(resp_buf.data);
+        return NULL;
+    }
+
+    if (!resp_buf.data) return NULL;
+
+    cJSON *json = cJSON_Parse(resp_buf.data);
+    free(resp_buf.data);
+
+    if (!json) {
+        LOGW("CLIP: failed to parse response JSON");
+        return NULL;
+    }
+
+    cJSON *embedding = cJSON_GetObjectItem(json, "embedding");
+    if (!embedding || !cJSON_IsArray(embedding)) {
+        LOGW("CLIP: response missing embedding array");
+        cJSON_Delete(json);
+        return NULL;
+    }
+
+    return json;
+}
+
+// Cosine similarity. Since CLIP embeddings are L2-normalized, this is just dot product.
+static float
+cosine_similarity(const float *a, const float *b, int dim) {
+    float dot = 0.0f;
+    float norm_a = 0.0f;
+    float norm_b = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    float denom = sqrtf(norm_a) * sqrtf(norm_b);
+    if (denom < 1e-8f) return 0.0f;
+    return dot / denom;
+}
+
+// Capture a frame and return its CLIP embedding as float array.
+// Caller must free the returned array. Sets *out_dim.
+// Also updates agent screen dimensions and optionally returns base64 screenshot.
+static float *
+clip_capture_embedding(struct sc_ai_agent *agent, int *out_dim,
+                       char **out_base64) {
+    *out_dim = 0;
+    if (out_base64) *out_base64 = NULL;
+
+    AVFrame *frame = av_frame_alloc();
+    if (!frame) return NULL;
+
+    bool has_frame = sc_ai_frame_sink_consume(agent->frame_sink, frame);
+    if (!has_frame) {
+        av_frame_free(&frame);
+        return NULL;
+    }
+
+    struct sc_ai_screenshot ss = {0};
+    if (!sc_ai_screenshot_encode(&ss, frame)) {
+        av_frame_free(&frame);
+        return NULL;
+    }
+    av_frame_free(&frame);
+
+    sc_mutex_lock(&agent->mutex);
+    agent->screen_width = ss.width;
+    agent->screen_height = ss.height;
+    sc_ai_tools_set_screen_size(&agent->tools, ss.width, ss.height);
+    sc_mutex_unlock(&agent->mutex);
+
+    cJSON *embed_resp = clip_call_embed(agent, ss.base64_data);
+    if (out_base64 && ss.base64_data) {
+        *out_base64 = strdup(ss.base64_data);
+    }
+    sc_ai_screenshot_destroy(&ss);
+
+    if (!embed_resp) return NULL;
+
+    cJSON *emb_arr = cJSON_GetObjectItem(embed_resp, "embedding");
+    int dim = cJSON_GetArraySize(emb_arr);
+    float *emb = malloc(sizeof(float) * (size_t)dim);
+    if (!emb) { cJSON_Delete(embed_resp); return NULL; }
+    for (int i = 0; i < dim; i++) {
+        emb[i] = (float)cJSON_GetArrayItem(emb_arr, i)->valuedouble;
+    }
+    cJSON_Delete(embed_resp);
+    *out_dim = dim;
+    return emb;
+}
+
+// Candidate match entry for ranked actions
+struct clip_match {
+    float sim;
+    int x, y, idx;
+};
+
+// Compare for qsort (descending similarity)
+static int
+clip_match_cmp(const void *a, const void *b) {
+    float sa = ((const struct clip_match *)a)->sim;
+    float sb = ((const struct clip_match *)b)->sim;
+    if (sb > sa) return 1;
+    if (sb < sa) return -1;
+    return 0;
+}
+
+#define CLIP_SIM_THRESHOLD 0.7f
+#define CLIP_SCREEN_CHANGE_THRESHOLD 0.95f
+#define CLIP_MAX_CANDIDATES 20
+
+// Run one cycle of CLIP-based auto-play with fallback actions + LLM.
+static bool
+clip_auto_cycle(struct sc_ai_agent *agent) {
+    // 1. Capture frame and get CLIP embedding
+    int cur_dim = 0;
+    char *cur_base64 = NULL;
+    float *cur_emb = clip_capture_embedding(agent, &cur_dim, &cur_base64);
+    if (!cur_emb) {
+        LOGW("CLIP: no frame or embedding failed");
+        free(cur_base64);
+        return false;
+    }
+
+    // 2. Parse stored embeddings
+    sc_mutex_lock(&agent->mutex);
+    char *emb_json = agent->clip_embeddings_json
+                     ? strdup(agent->clip_embeddings_json) : NULL;
+    sc_mutex_unlock(&agent->mutex);
+
+    if (!emb_json) {
+        free(cur_emb);
+        free(cur_base64);
+        return false;
+    }
+
+    cJSON *stored = cJSON_Parse(emb_json);
+    free(emb_json);
+    if (!stored || !cJSON_IsArray(stored)) {
+        cJSON_Delete(stored);
+        free(cur_emb);
+        free(cur_base64);
+        return false;
+    }
+
+    // 3. Collect ALL candidates above threshold (sim >= 0.7)
+    struct clip_match candidates[CLIP_MAX_CANDIDATES];
+    int n_candidates = 0;
+
+    cJSON *entry;
+    cJSON_ArrayForEach(entry, stored) {
+        if (n_candidates >= CLIP_MAX_CANDIDATES) break;
+
+        cJSON *emb_arr = cJSON_GetObjectItem(entry, "embedding");
+        if (!emb_arr || !cJSON_IsArray(emb_arr)) continue;
+        int dim = cJSON_GetArraySize(emb_arr);
+        if (dim != cur_dim) continue;
+
+        float *stored_emb = malloc(sizeof(float) * (size_t)dim);
+        if (!stored_emb) continue;
+        for (int i = 0; i < dim; i++) {
+            stored_emb[i] = (float)cJSON_GetArrayItem(emb_arr, i)->valuedouble;
+        }
+        float sim = cosine_similarity(cur_emb, stored_emb, dim);
+        free(stored_emb);
+
+        if (sim >= CLIP_SIM_THRESHOLD) {
+            cJSON *jx = cJSON_GetObjectItem(entry, "x");
+            cJSON *jy = cJSON_GetObjectItem(entry, "y");
+            cJSON *jidx = cJSON_GetObjectItem(entry, "index");
+
+            // Deduplicate: skip if same coordinates (within 20px) already exists
+            int tx = jx ? jx->valueint : 0;
+            int ty = jy ? jy->valueint : 0;
+            bool dup = false;
+            for (int j = 0; j < n_candidates; j++) {
+                if (abs(candidates[j].x - tx) < 20
+                        && abs(candidates[j].y - ty) < 20) {
+                    // Keep the one with higher similarity
+                    if (sim > candidates[j].sim) {
+                        candidates[j].sim = sim;
+                        candidates[j].idx = jidx ? jidx->valueint : -1;
+                    }
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                candidates[n_candidates].sim = sim;
+                candidates[n_candidates].x = tx;
+                candidates[n_candidates].y = ty;
+                candidates[n_candidates].idx = jidx ? jidx->valueint : -1;
+                n_candidates++;
+            }
+        }
+    }
+    cJSON_Delete(stored);
+    free(cur_emb);
+
+    // No candidates at all
+    if (n_candidates == 0) {
+        LOGI("CLIP: no match above threshold");
+        sc_mutex_lock(&agent->mutex);
+        sc_ai_message_list_push(&agent->messages, "assistant",
+            "[CLIP] No matching captures found - waiting...");
+        sc_mutex_unlock(&agent->mutex);
+        free(cur_base64);
+        return false;
+    }
+
+    // Sort by descending similarity
+    qsort(candidates, (size_t)n_candidates, sizeof(struct clip_match),
+           clip_match_cmp);
+
+    LOGI("CLIP: %d candidates found, top sim=%.3f",
+         n_candidates, candidates[0].sim);
+
+    // 4. Try each candidate action, checking for screen change
+    char tried_desc[512] = "";
+    size_t tried_len = 0;
+
+    for (int i = 0; i < n_candidates; i++) {
+        struct clip_match *m = &candidates[i];
+
+        // Execute touch
+        char args_json[128];
+        snprintf(args_json, sizeof(args_json),
+                 "{\"x\":%d,\"y\":%d}", m->x, m->y);
+
+        LOGI("CLIP: trying #%d (sim=%.3f) -> tap (%d,%d) [attempt %d/%d]",
+             m->idx, m->sim, m->x, m->y, i + 1, n_candidates);
+
+        char *result = sc_ai_tools_execute(
+            &agent->tools, "position_click", args_json);
+        free(result);
+
+        // Log attempt
+        sc_mutex_lock(&agent->mutex);
+        char log_msg[256];
+        snprintf(log_msg, sizeof(log_msg),
+                 "[CLIP] #%d (sim=%.2f) -> tap (%d,%d) [%d/%d]",
+                 m->idx, m->sim, m->x, m->y, i + 1, n_candidates);
+        sc_ai_message_list_push(&agent->messages, "assistant", log_msg);
+        sc_mutex_unlock(&agent->mutex);
+
+        // Track tried actions for LLM fallback
+        tried_len += (size_t)snprintf(tried_desc + tried_len,
+            sizeof(tried_desc) - tried_len,
+            "tap(%d,%d) ", m->x, m->y);
+
+        // If this is the last candidate, don't bother checking screen change
+        if (i == n_candidates - 1) break;
+
+        // Wait for action to take effect
+        SDL_Delay(1500);
+
+        // Check if screen changed
+        int new_dim = 0;
+        float *new_emb = clip_capture_embedding(agent, &new_dim, NULL);
+        if (new_emb && new_dim == cur_dim) {
+            // Recompute similarity with the ORIGINAL screen embedding
+            // We need cur_emb again... re-embed from base64
+            cJSON *re_resp = cur_base64 ? clip_call_embed(agent, cur_base64)
+                                        : NULL;
+            if (re_resp) {
+                cJSON *re_arr = cJSON_GetObjectItem(re_resp, "embedding");
+                int re_dim = cJSON_GetArraySize(re_arr);
+                float *re_emb = malloc(sizeof(float) * (size_t)re_dim);
+                if (re_emb) {
+                    for (int k = 0; k < re_dim; k++) {
+                        re_emb[k] = (float)
+                            cJSON_GetArrayItem(re_arr, k)->valuedouble;
+                    }
+                    float screen_sim = cosine_similarity(
+                        new_emb, re_emb, re_dim);
+                    free(re_emb);
+                    LOGI("CLIP: screen change check: sim=%.3f (threshold=%.2f)",
+                         screen_sim, CLIP_SCREEN_CHANGE_THRESHOLD);
+
+                    if (screen_sim < CLIP_SCREEN_CHANGE_THRESHOLD) {
+                        // Screen changed! Action succeeded.
+                        LOGI("CLIP: screen changed after action %d", i + 1);
+                        cJSON_Delete(re_resp);
+                        free(new_emb);
+                        free(cur_base64);
+                        return true;
+                    }
+                }
+                cJSON_Delete(re_resp);
+            }
+        }
+        free(new_emb);
+        // Screen didn't change, try next candidate
+        LOGI("CLIP: screen unchanged, trying next action...");
+    }
+
+    free(cur_base64);
+
+    // 5. ALL clip actions tried - log and let auto_thread retry
+    LOGI("CLIP: all %d actions tried, will retry next cycle", n_candidates);
+
+    sc_mutex_lock(&agent->mutex);
+    char fail_msg[256];
+    snprintf(fail_msg, sizeof(fail_msg),
+             "[CLIP] Tried %d actions (%s) - retrying...",
+             n_candidates, tried_desc);
+    sc_ai_message_list_push(&agent->messages, "assistant", fail_msg);
+    sc_mutex_unlock(&agent->mutex);
+
+    return true;
+}
+
 static int
 auto_thread_fn(void *data) {
     struct sc_ai_agent *agent = data;
@@ -1062,10 +1443,17 @@ auto_thread_fn(void *data) {
         bool has_rules = agent->game_rules && agent->game_rules[0] != '\0';
         char *rules_copy = NULL;
 
+        // Check for CLIP mode (highest priority)
+        bool clip_mode = false;
+        if (running && agent->clip_embeddings_json
+                && agent->clip_embeddings_json[0]) {
+            clip_mode = true;
+        }
+
         // Check for tree mode
         bool tree_mode = false;
         char *tree_json_copy = NULL;
-        if (running && agent->train_tree_json
+        if (running && !clip_mode && agent->train_tree_json
                 && agent->train_tree_json[0]) {
             // Quick check: parse and see if it has states
             cJSON *tree_check = cJSON_Parse(agent->train_tree_json);
@@ -1087,6 +1475,13 @@ auto_thread_fn(void *data) {
         if (!running) {
             rules_sent = false;
             SDL_Delay(100);
+            continue;
+        }
+
+        // ============ CLIP MODE (highest priority) ============
+        if (clip_mode) {
+            clip_auto_cycle(agent);
+            SDL_Delay(2000);
             continue;
         }
 
@@ -1194,6 +1589,8 @@ sc_ai_agent_init(struct sc_ai_agent *agent,
     agent->record_count = 0;
     agent->record_dir = NULL;
     agent->train_tree_json = NULL;
+    agent->clip_embeddings_json = NULL;
+    agent->clip_port = 8081;
 
     // Set up train log path
     const char *home = getenv("HOME");
@@ -1266,6 +1663,7 @@ sc_ai_agent_destroy(struct sc_ai_agent *agent) {
     free(agent->game_rules);
     free(agent->record_dir);
     free(agent->train_tree_json);
+    free(agent->clip_embeddings_json);
 
     sc_ai_message_list_destroy(&agent->messages);
 
@@ -1949,4 +2347,198 @@ sc_ai_agent_match_state(struct sc_ai_agent *agent,
                                          width, height, states);
     cJSON_Delete(tree);
     return result ? result : strdup("UNKNOWN");
+}
+
+// --- CLIP public functions ---
+
+char *
+sc_ai_agent_clip_embed(struct sc_ai_agent *agent,
+                       const char *session_name, int index) {
+    const char *home = getenv("HOME");
+    if (!home || !session_name || index <= 0) return NULL;
+    if (strstr(session_name, "..") || strchr(session_name, '/')) return NULL;
+
+    // Read the .jpg file
+    char img_path[1024];
+    snprintf(img_path, sizeof(img_path), "%s/scrcpy_records/%s/%04d.jpg",
+             home, session_name, index);
+
+    FILE *f = fopen(img_path, "rb");
+    if (!f) {
+        LOGW("CLIP: could not open %s", img_path);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > 10 * 1024 * 1024) {
+        fclose(f);
+        return NULL;
+    }
+    uint8_t *data = malloc((size_t)fsize);
+    if (!data) { fclose(f); return NULL; }
+    size_t nread = fread(data, 1, (size_t)fsize, f);
+    fclose(f);
+    if (nread != (size_t)fsize) { free(data); return NULL; }
+
+    // Base64 encode
+    char *b64 = base64_encode_data(data, (size_t)fsize);
+    free(data);
+    if (!b64) return NULL;
+
+    // Call CLIP server
+    cJSON *resp = clip_call_embed(agent, b64);
+    free(b64);
+    if (!resp) return NULL;
+
+    // Build result JSON: {"index":N, "embedding":[...]}
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddNumberToObject(result, "index", index);
+    cJSON *emb = cJSON_DetachItemFromObject(resp, "embedding");
+    cJSON_AddItemToObject(result, "embedding", emb);
+    cJSON_Delete(resp);
+
+    char *json_str = cJSON_PrintUnformatted(result);
+    cJSON_Delete(result);
+    return json_str;
+}
+
+bool
+sc_ai_agent_clip_embed_session(struct sc_ai_agent *agent,
+                                const char *session_name,
+                                int index) {
+    const char *home = getenv("HOME");
+    if (!home || !session_name || index <= 0) return false;
+    if (strstr(session_name, "..") || strchr(session_name, '/')) return false;
+
+    // Read x,y,w,h from .txt file
+    char txt_path[1024];
+    snprintf(txt_path, sizeof(txt_path), "%s/scrcpy_records/%s/%04d.txt",
+             home, session_name, index);
+    int tx = 0, ty = 0, tw = 0, th = 0;
+    FILE *f = fopen(txt_path, "r");
+    if (f) {
+        if (fscanf(f, "%d %d %d %d", &tx, &ty, &tw, &th) < 4) {
+            // partial read ok
+        }
+        fclose(f);
+    }
+
+    // Get embedding
+    char *embed_json = sc_ai_agent_clip_embed(agent, session_name, index);
+    if (!embed_json) {
+        LOGW("CLIP: embed failed for %s #%d", session_name, index);
+        return false;
+    }
+
+    cJSON *new_entry = cJSON_Parse(embed_json);
+    free(embed_json);
+    if (!new_entry) return false;
+
+    // Add x, y, w, h fields
+    cJSON_AddNumberToObject(new_entry, "x", tx);
+    cJSON_AddNumberToObject(new_entry, "y", ty);
+    cJSON_AddNumberToObject(new_entry, "w", tw);
+    cJSON_AddNumberToObject(new_entry, "h", th);
+
+    // Read existing embeddings.json
+    char emb_path[1024];
+    snprintf(emb_path, sizeof(emb_path), "%s/scrcpy_records/%s/embeddings.json",
+             home, session_name);
+
+    cJSON *arr = NULL;
+    f = fopen(emb_path, "r");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long fsize = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (fsize > 0 && fsize < 100 * 1024 * 1024) {
+            char *buf = malloc((size_t)fsize + 1);
+            if (buf) {
+                size_t nread = fread(buf, 1, (size_t)fsize, f);
+                buf[nread] = '\0';
+                arr = cJSON_Parse(buf);
+                free(buf);
+            }
+        }
+        fclose(f);
+    }
+    if (!arr || !cJSON_IsArray(arr)) {
+        cJSON_Delete(arr);
+        arr = cJSON_CreateArray();
+    }
+
+    // Remove existing entry for this index if present
+    int n = cJSON_GetArraySize(arr);
+    for (int i = n - 1; i >= 0; i--) {
+        cJSON *item = cJSON_GetArrayItem(arr, i);
+        cJSON *jidx = cJSON_GetObjectItem(item, "index");
+        if (jidx && jidx->valueint == index) {
+            cJSON_DeleteItemFromArray(arr, i);
+        }
+    }
+
+    // Append new entry
+    cJSON_AddItemToArray(arr, new_entry);
+
+    // Write back
+    char *out = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+    if (!out) return false;
+
+    f = fopen(emb_path, "w");
+    if (f) {
+        fwrite(out, 1, strlen(out), f);
+        fclose(f);
+    }
+    free(out);
+
+    LOGI("CLIP: embedded %s #%d -> %s", session_name, index, emb_path);
+    return true;
+}
+
+char *
+sc_ai_agent_clip_load_embeddings(const char *session_name) {
+    const char *home = getenv("HOME");
+    if (!home || !session_name) return NULL;
+    if (strstr(session_name, "..") || strchr(session_name, '/')) return NULL;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/scrcpy_records/%s/embeddings.json",
+             home, session_name);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > 100 * 1024 * 1024) {
+        fclose(f);
+        return NULL;
+    }
+
+    char *buf = malloc((size_t)fsize + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t nread = fread(buf, 1, (size_t)fsize, f);
+    fclose(f);
+    buf[nread] = '\0';
+    return buf;
+}
+
+void
+sc_ai_agent_set_clip_embeddings(struct sc_ai_agent *agent, const char *json) {
+    sc_mutex_lock(&agent->mutex);
+    free(agent->clip_embeddings_json);
+    agent->clip_embeddings_json = json ? strdup(json) : NULL;
+    sc_mutex_unlock(&agent->mutex);
+}
+
+char *
+sc_ai_agent_get_clip_embeddings(struct sc_ai_agent *agent) {
+    sc_mutex_lock(&agent->mutex);
+    char *copy = agent->clip_embeddings_json
+                 ? strdup(agent->clip_embeddings_json) : NULL;
+    sc_mutex_unlock(&agent->mutex);
+    return copy;
 }

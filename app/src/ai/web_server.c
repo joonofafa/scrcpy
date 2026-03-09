@@ -2,9 +2,13 @@
 
 #include <string.h>
 
+#include <libavutil/frame.h>
 #include <libavcodec/avcodec.h>
 
 #include "ai_agent.h"
+#include "ai_frame_sink.h"
+#include "ai_tools.h"
+#include "screenshot.h"
 #include "web_ui.h"
 #include "web_video_sink.h"
 #include "cJSON.h"
@@ -122,8 +126,16 @@ build_state_json(struct sc_ai_agent *agent) {
     cJSON_AddStringToObject(root, "game_rules",
         agent->game_rules ? agent->game_rules : "");
 
-    // Play mode: tree > rules > none
-    if (agent->train_tree_json && agent->train_tree_json[0]) {
+    // Play mode: clip > tree > rules > none
+    if (agent->clip_embeddings_json && agent->clip_embeddings_json[0]) {
+        cJSON_AddStringToObject(root, "play_mode", "clip");
+        // Count embeddings
+        cJSON *emb_arr = cJSON_Parse(agent->clip_embeddings_json);
+        int clip_count = (emb_arr && cJSON_IsArray(emb_arr))
+                         ? cJSON_GetArraySize(emb_arr) : 0;
+        cJSON_Delete(emb_arr);
+        cJSON_AddNumberToObject(root, "clip_count", clip_count);
+    } else if (agent->train_tree_json && agent->train_tree_json[0]) {
         // Check if tree has states
         cJSON *tree = cJSON_Parse(agent->train_tree_json);
         cJSON *states = tree ? cJSON_GetObjectItem(tree, "states") : NULL;
@@ -351,6 +363,234 @@ handle_event(struct mg_connection *c, int ev, void *ev_data) {
                 "");
             return;
         }
+
+        // ============================================================
+        // Internal API (for Python backend)
+        // ============================================================
+
+        // GET /internal/screenshot — capture frame, return JPEG binary
+        if (mg_match(hm->method, mg_str("GET"), NULL)
+                && mg_match(hm->uri, mg_str("/internal/screenshot"), NULL)) {
+            if (!agent || !agent->frame_sink) {
+                send_error(c, 500, "no frame sink");
+                return;
+            }
+            AVFrame *frame = av_frame_alloc();
+            if (!frame) {
+                send_error(c, 500, "alloc failed");
+                return;
+            }
+            if (!sc_ai_frame_sink_consume(agent->frame_sink, frame)) {
+                av_frame_free(&frame);
+                send_error(c, 503, "no frame available");
+                return;
+            }
+            uint16_t orig_w = (uint16_t)frame->width;
+            uint16_t orig_h = (uint16_t)frame->height;
+
+            struct sc_ai_screenshot ss = {0};
+            if (!sc_ai_screenshot_encode(&ss, frame)) {
+                av_frame_free(&frame);
+                send_error(c, 500, "encode failed");
+                return;
+            }
+            av_frame_free(&frame);
+
+            // Update agent screen/frame sizes
+            sc_mutex_lock(&agent->mutex);
+            agent->screen_width = ss.width;
+            agent->screen_height = ss.height;
+            sc_ai_tools_set_screen_size(&agent->tools, ss.width, ss.height);
+            sc_ai_tools_set_frame_size(&agent->tools, orig_w, orig_h);
+            sc_mutex_unlock(&agent->mutex);
+
+            // Send JPEG binary with dimension headers
+            char headers[256];
+            snprintf(headers, sizeof(headers),
+                "Content-Type: image/jpeg\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "X-Screenshot-Width: %u\r\n"
+                "X-Screenshot-Height: %u\r\n"
+                "X-Frame-Width: %u\r\n"
+                "X-Frame-Height: %u\r\n",
+                (unsigned)ss.width, (unsigned)ss.height,
+                (unsigned)orig_w, (unsigned)orig_h);
+            mg_http_reply(c, 200, headers, "");
+            // Append raw JPEG data after headers
+            // Actually mg_http_reply already sent body as empty string.
+            // We need to send binary body. Use mg_printf + mg_send instead.
+            // Redo: send manually
+            c->send.len = 0; // clear what mg_http_reply wrote
+            mg_printf(c,
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: image/jpeg\r\n"
+                "Content-Length: %lu\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Expose-Headers: X-Screenshot-Width, X-Screenshot-Height, X-Frame-Width, X-Frame-Height\r\n"
+                "X-Screenshot-Width: %u\r\n"
+                "X-Screenshot-Height: %u\r\n"
+                "X-Frame-Width: %u\r\n"
+                "X-Frame-Height: %u\r\n"
+                "\r\n",
+                (unsigned long)ss.png_size,
+                (unsigned)ss.width, (unsigned)ss.height,
+                (unsigned)orig_w, (unsigned)orig_h);
+            mg_send(c, ss.png_data, ss.png_size);
+            sc_ai_screenshot_destroy(&ss);
+            return;
+        }
+
+        // POST /internal/click — inject tap (DOWN/MOVE/UP sequence)
+        if (mg_match(hm->method, mg_str("POST"), NULL)
+                && mg_match(hm->uri, mg_str("/internal/click"), NULL)) {
+            cJSON *body = parse_body(hm);
+            if (!body) { send_error(c, 400, "invalid json"); return; }
+            cJSON *jx = cJSON_GetObjectItem(body, "x");
+            cJSON *jy = cJSON_GetObjectItem(body, "y");
+            if (!jx || !jy) {
+                cJSON_Delete(body);
+                send_error(c, 400, "missing x or y");
+                return;
+            }
+            char args[128];
+            cJSON *jw = cJSON_GetObjectItem(body, "w");
+            cJSON *jh = cJSON_GetObjectItem(body, "h");
+            if (jw && jh) {
+                snprintf(args, sizeof(args), "{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}",
+                         jx->valueint, jy->valueint, jw->valueint, jh->valueint);
+            } else {
+                snprintf(args, sizeof(args), "{\"x\":%d,\"y\":%d}",
+                         jx->valueint, jy->valueint);
+            }
+            cJSON_Delete(body);
+            char *result = sc_ai_tools_execute(&agent->tools,
+                                                "position_click", args);
+            mg_http_reply(c, 200,
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n",
+                "%s", result ? result : "{\"error\":\"null\"}");
+            free(result);
+            return;
+        }
+
+        // POST /internal/long_press
+        if (mg_match(hm->method, mg_str("POST"), NULL)
+                && mg_match(hm->uri, mg_str("/internal/long_press"), NULL)) {
+            cJSON *body = parse_body(hm);
+            if (!body) { send_error(c, 400, "invalid json"); return; }
+            char args[128];
+            cJSON *jx = cJSON_GetObjectItem(body, "x");
+            cJSON *jy = cJSON_GetObjectItem(body, "y");
+            cJSON *jms = cJSON_GetObjectItem(body, "duration_ms");
+            if (!jx || !jy) {
+                cJSON_Delete(body);
+                send_error(c, 400, "missing x or y");
+                return;
+            }
+            snprintf(args, sizeof(args), "{\"x\":%d,\"y\":%d,\"duration_ms\":%d}",
+                     jx->valueint, jy->valueint,
+                     jms ? jms->valueint : 500);
+            cJSON_Delete(body);
+            char *result = sc_ai_tools_execute(&agent->tools,
+                                                "position_long_press", args);
+            mg_http_reply(c, 200,
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n",
+                "%s", result ? result : "{\"error\":\"null\"}");
+            free(result);
+            return;
+        }
+
+        // POST /internal/swipe
+        if (mg_match(hm->method, mg_str("POST"), NULL)
+                && mg_match(hm->uri, mg_str("/internal/swipe"), NULL)) {
+            cJSON *body = parse_body(hm);
+            if (!body) { send_error(c, 400, "invalid json"); return; }
+            char *str = cJSON_PrintUnformatted(body);
+            cJSON_Delete(body);
+            char *result = sc_ai_tools_execute(&agent->tools, "swipe",
+                                                str ? str : "{}");
+            free(str);
+            mg_http_reply(c, 200,
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n",
+                "%s", result ? result : "{\"error\":\"null\"}");
+            free(result);
+            return;
+        }
+
+        // POST /internal/key
+        if (mg_match(hm->method, mg_str("POST"), NULL)
+                && mg_match(hm->uri, mg_str("/internal/key"), NULL)) {
+            cJSON *body = parse_body(hm);
+            if (!body) { send_error(c, 400, "invalid json"); return; }
+            cJSON *jkc = cJSON_GetObjectItem(body, "keycode");
+            cJSON *jact = cJSON_GetObjectItem(body, "action");
+            if (!jkc) {
+                cJSON_Delete(body);
+                send_error(c, 400, "missing keycode");
+                return;
+            }
+            const char *action = jact && jact->valuestring
+                                 ? jact->valuestring : "press";
+            char args[64];
+            snprintf(args, sizeof(args), "{\"keycode\":%d}", jkc->valueint);
+            char *result;
+            if (strcmp(action, "down") == 0) {
+                result = sc_ai_tools_execute(&agent->tools, "key_down", args);
+            } else if (strcmp(action, "up") == 0) {
+                result = sc_ai_tools_execute(&agent->tools, "key_up", args);
+            } else {
+                result = sc_ai_tools_execute(&agent->tools, "key_press", args);
+            }
+            cJSON_Delete(body);
+            mg_http_reply(c, 200,
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n",
+                "%s", result ? result : "{\"error\":\"null\"}");
+            free(result);
+            return;
+        }
+
+        // POST /internal/text
+        if (mg_match(hm->method, mg_str("POST"), NULL)
+                && mg_match(hm->uri, mg_str("/internal/text"), NULL)) {
+            cJSON *body = parse_body(hm);
+            if (!body) { send_error(c, 400, "invalid json"); return; }
+            char *str = cJSON_PrintUnformatted(body);
+            cJSON_Delete(body);
+            char *result = sc_ai_tools_execute(&agent->tools, "input_text",
+                                                str ? str : "{}");
+            free(str);
+            mg_http_reply(c, 200,
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n",
+                "%s", result ? result : "{\"error\":\"null\"}");
+            free(result);
+            return;
+        }
+
+        // GET /internal/info
+        if (mg_match(hm->method, mg_str("GET"), NULL)
+                && mg_match(hm->uri, mg_str("/internal/info"), NULL)) {
+            sc_mutex_lock(&agent->mutex);
+            uint16_t sw = agent->screen_width;
+            uint16_t sh = agent->screen_height;
+            uint16_t fw = agent->tools.frame_width;
+            uint16_t fh = agent->tools.frame_height;
+            sc_mutex_unlock(&agent->mutex);
+            mg_http_reply(c, 200,
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n",
+                "{\"screenshot_width\":%u,\"screenshot_height\":%u,"
+                "\"frame_width\":%u,\"frame_height\":%u}",
+                (unsigned)sw, (unsigned)sh, (unsigned)fw, (unsigned)fh);
+            return;
+        }
+
+        // ============================================================
+        // WebSocket upgrades
+        // ============================================================
 
         // WebSocket upgrade: /ws/video
         // Set data[0] BEFORE upgrade so MG_EV_WS_OPEN handler sees it
@@ -742,6 +982,103 @@ handle_event(struct mg_connection *c, int ev, void *ev_data) {
             return;
         }
 
+        // POST /api/train/embed — embed a single capture via CLIP
+        if (mg_match(hm->method, mg_str("POST"), NULL)
+                && mg_match(hm->uri, mg_str("/api/train/embed"), NULL)) {
+            cJSON *body = parse_body(hm);
+            if (!body) {
+                send_error(c, 400, "invalid json");
+                return;
+            }
+            cJSON *sess = cJSON_GetObjectItem(body, "session");
+            cJSON *idx_item = cJSON_GetObjectItem(body, "index");
+            if (!cJSON_IsString(sess) || !cJSON_IsNumber(idx_item)) {
+                cJSON_Delete(body);
+                send_error(c, 400, "missing session or index");
+                return;
+            }
+            bool ok = sc_ai_agent_clip_embed_session(
+                agent, sess->valuestring, idx_item->valueint);
+            cJSON_Delete(body);
+            if (ok) {
+                send_ok(c);
+            } else {
+                send_error(c, 500, "embedding failed");
+            }
+            return;
+        }
+
+        // GET /api/train/embeddings?session=XXX — load embeddings from session
+        if (mg_match(hm->method, mg_str("GET"), NULL)
+                && mg_match(hm->uri,
+                    mg_str("/api/train/embeddings"), NULL)) {
+            char sess_buf[256];
+            int r = mg_http_get_var(&hm->query, "session",
+                                     sess_buf, sizeof(sess_buf));
+            if (r <= 0) {
+                send_error(c, 400, "missing session parameter");
+                return;
+            }
+            char *json = sc_ai_agent_clip_load_embeddings(sess_buf);
+            if (json) {
+                mg_http_reply(c, 200,
+                    "Content-Type: application/json\r\n"
+                    "Access-Control-Allow-Origin: *\r\n",
+                    "%s", json);
+                free(json);
+            } else {
+                mg_http_reply(c, 200,
+                    "Content-Type: application/json\r\n"
+                    "Access-Control-Allow-Origin: *\r\n",
+                    "[]");
+            }
+            return;
+        }
+
+        // POST /api/clip/load — load embeddings into agent memory for play
+        if (mg_match(hm->method, mg_str("POST"), NULL)
+                && mg_match(hm->uri, mg_str("/api/clip/load"), NULL)) {
+            cJSON *body = parse_body(hm);
+            if (!body) {
+                send_error(c, 400, "invalid json");
+                return;
+            }
+            cJSON *sess = cJSON_GetObjectItem(body, "session");
+            if (!cJSON_IsString(sess)) {
+                cJSON_Delete(body);
+                send_error(c, 400, "missing session field");
+                return;
+            }
+            char *json = sc_ai_agent_clip_load_embeddings(sess->valuestring);
+            cJSON_Delete(body);
+            if (!json) {
+                send_error(c, 404, "no embeddings found");
+                return;
+            }
+            // Count entries
+            cJSON *arr = cJSON_Parse(json);
+            int count = (arr && cJSON_IsArray(arr))
+                        ? cJSON_GetArraySize(arr) : 0;
+            cJSON_Delete(arr);
+
+            sc_ai_agent_set_clip_embeddings(agent, json);
+            free(json);
+
+            cJSON *resp = cJSON_CreateObject();
+            cJSON_AddBoolToObject(resp, "ok", 1);
+            cJSON_AddNumberToObject(resp, "count", count);
+            send_json_response(c, resp);
+            return;
+        }
+
+        // POST /api/clip/clear — clear loaded embeddings
+        if (mg_match(hm->method, mg_str("POST"), NULL)
+                && mg_match(hm->uri, mg_str("/api/clip/clear"), NULL)) {
+            sc_ai_agent_set_clip_embeddings(agent, NULL);
+            send_ok(c);
+            return;
+        }
+
         // 404
         send_error(c, 404, "not found");
 
@@ -780,6 +1117,17 @@ handle_event(struct mg_connection *c, int ev, void *ev_data) {
                 free(config_data);
             } else {
                 LOGW("No config data available for video WS client");
+            }
+
+            // Send cached last keyframe for instant display
+            uint8_t *kf_data;
+            size_t kf_size;
+            if (sc_web_video_sink_get_keyframe(server->video_sink,
+                                               &kf_data, &kf_size)) {
+                mg_ws_send(c, (const char *)kf_data, kf_size,
+                           WEBSOCKET_OP_BINARY);
+                free(kf_data);
+                LOGI("Sent cached keyframe: %zu bytes", kf_size);
             }
 
             LOGI("Video WebSocket client connected: %ux%u",

@@ -28,6 +28,10 @@ struct sc_web_video_sink {
     uint8_t *config_data;
     size_t config_size;
 
+    // Last keyframe cache (sent to new clients for instant display)
+    uint8_t *keyframe_data;
+    size_t keyframe_size;
+
     // Ring buffer (demuxer thread -> web thread)
     struct sc_web_video_sink_packet queue[SC_WEB_VIDEO_SINK_QUEUE_SIZE];
     unsigned queue_head;
@@ -55,6 +59,11 @@ sc_web_video_sink_drain(struct sc_web_video_sink *sink,
 bool
 sc_web_video_sink_get_config(struct sc_web_video_sink *sink,
                              uint8_t **data, size_t *size);
+
+// Get a copy of the last keyframe. Caller must free *data.
+bool
+sc_web_video_sink_get_keyframe(struct sc_web_video_sink *sink,
+                               uint8_t **data, size_t *size);
 
 // Get video dimensions
 void

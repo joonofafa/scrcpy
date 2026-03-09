@@ -120,6 +120,15 @@ sc_web_video_sink_push(struct sc_packet_sink *ps, const AVPacket *packet) {
 
     // Cache config (SPS/PPS)
     if (is_config) {
+        // If config changed, invalidate cached keyframe (wrong params)
+        if (sink->config_data == NULL
+                || sink->config_size != (size_t)packet->size
+                || memcmp(sink->config_data, packet->data,
+                          packet->size) != 0) {
+            free(sink->keyframe_data);
+            sink->keyframe_data = NULL;
+            sink->keyframe_size = 0;
+        }
         free(sink->config_data);
         sink->config_data = malloc(packet->size);
         if (sink->config_data) {
@@ -140,6 +149,17 @@ sc_web_video_sink_push(struct sc_packet_sink *ps, const AVPacket *packet) {
         return true; // non-fatal, just drop
     }
 
+    // Cache last keyframe for instant playback on new client connect
+    if (is_key && !is_config) {
+        free(sink->keyframe_data);
+        sink->keyframe_data = malloc(out_size);
+        if (sink->keyframe_data) {
+            memcpy(sink->keyframe_data, copy, out_size);
+            sink->keyframe_size = out_size;
+        } else {
+            sink->keyframe_size = 0;
+        }
+    }
 
     // If queue is full, drop oldest
     if (sink->queue_count == SC_WEB_VIDEO_SINK_QUEUE_SIZE) {
@@ -176,6 +196,8 @@ sc_web_video_sink_init(struct sc_web_video_sink *sink) {
 
     sink->config_data = NULL;
     sink->config_size = 0;
+    sink->keyframe_data = NULL;
+    sink->keyframe_size = 0;
     sink->queue_head = 0;
     sink->queue_tail = 0;
     sink->queue_count = 0;
@@ -242,6 +264,32 @@ sc_web_video_sink_get_config(struct sc_web_video_sink *sink,
     return true;
 }
 
+bool
+sc_web_video_sink_get_keyframe(struct sc_web_video_sink *sink,
+                                uint8_t **data, size_t *size) {
+    sc_mutex_lock(&sink->mutex);
+
+    if (!sink->keyframe_data || sink->keyframe_size == 0) {
+        sc_mutex_unlock(&sink->mutex);
+        *data = NULL;
+        *size = 0;
+        return false;
+    }
+
+    *data = malloc(sink->keyframe_size);
+    if (!*data) {
+        sc_mutex_unlock(&sink->mutex);
+        *size = 0;
+        return false;
+    }
+
+    memcpy(*data, sink->keyframe_data, sink->keyframe_size);
+    *size = sink->keyframe_size;
+
+    sc_mutex_unlock(&sink->mutex);
+    return true;
+}
+
 void
 sc_web_video_sink_get_size(struct sc_web_video_sink *sink,
                            uint16_t *width, uint16_t *height) {
@@ -277,5 +325,6 @@ sc_web_video_sink_destroy(struct sc_web_video_sink *sink) {
     }
 
     free(sink->config_data);
+    free(sink->keyframe_data);
     sc_mutex_destroy(&sink->mutex);
 }

@@ -69,6 +69,10 @@ struct sc_ai_agent {
 
     // Train phase: decision tree JSON
     char *train_tree_json;
+
+    // CLIP embeddings JSON (array of {index, x, y, w, h, embedding:[...]})
+    char *clip_embeddings_json;
+    uint16_t clip_port;  // CLIP server port (default 8081)
 };
 
 struct sc_ai_agent_params {
@@ -172,5 +176,28 @@ char *
 sc_ai_agent_match_state(struct sc_ai_agent *agent,
                         const char *base64_data,
                         uint16_t width, uint16_t height);
+
+// CLIP embedding functions
+// Embed a single capture image via CLIP server (caller must free result JSON)
+char *
+sc_ai_agent_clip_embed(struct sc_ai_agent *agent,
+                       const char *session_name, int index);
+
+// Embed all captures in a session, save embeddings.json in session dir
+bool
+sc_ai_agent_clip_embed_session(struct sc_ai_agent *agent,
+                                const char *session_name,
+                                int index);
+
+// Load embeddings from session dir (caller must free)
+char *
+sc_ai_agent_clip_load_embeddings(const char *session_name);
+
+// Set/get CLIP embeddings JSON
+void
+sc_ai_agent_set_clip_embeddings(struct sc_ai_agent *agent, const char *json);
+
+char *
+sc_ai_agent_get_clip_embeddings(struct sc_ai_agent *agent);
 
 #endif
