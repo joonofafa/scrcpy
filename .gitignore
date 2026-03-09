@@ -9,3 +9,7 @@ build/
 local.properties
 /scrcpy-server
 ocr-venv/
+__pycache__/
+*.pyc
+ai-venv/
+clip-venv/
