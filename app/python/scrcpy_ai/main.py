@@ -1,11 +1,13 @@
 """FastAPI application entry point."""
 
 import argparse
+import asyncio
 import logging
 import os
 
 import uvicorn
-from fastapi import FastAPI
+import websockets
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 from scrcpy_ai.config import config
@@ -31,11 +33,66 @@ async def shutdown():
     client.close()
 
 
+# WebSocket proxy: relay /ws/video and /ws/control to C backend
+async def _ws_proxy(client_ws: WebSocket, path: str):
+    backend_url = f"ws://{config.scrcpy_host}:{config.scrcpy_port}{path}"
+    await client_ws.accept()
+    try:
+        async with websockets.connect(backend_url) as backend_ws:
+            async def forward_to_client():
+                try:
+                    async for msg in backend_ws:
+                        if isinstance(msg, bytes):
+                            await client_ws.send_bytes(msg)
+                        else:
+                            await client_ws.send_text(msg)
+                except Exception:
+                    pass
+
+            async def forward_to_backend():
+                try:
+                    while True:
+                        data = await client_ws.receive()
+                        if "text" in data and data["text"]:
+                            await backend_ws.send(data["text"])
+                        elif "bytes" in data and data["bytes"]:
+                            await backend_ws.send(data["bytes"])
+                except WebSocketDisconnect:
+                    pass
+                except Exception:
+                    pass
+
+            done, pending = await asyncio.wait(
+                [asyncio.create_task(forward_to_client()),
+                 asyncio.create_task(forward_to_backend())],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+    except Exception as e:
+        logger.warning("WebSocket proxy error (%s): %s", path, e)
+    finally:
+        try:
+            await client_ws.close()
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/video")
+async def ws_video(ws: WebSocket):
+    await _ws_proxy(ws, "/ws/video")
+
+
+@app.websocket("/ws/control")
+async def ws_control(ws: WebSocket):
+    await _ws_proxy(ws, "/ws/control")
+
+
 # Register API routes
 from scrcpy_ai.web.routes import router  # noqa: E402
 app.include_router(router)
 
-# Serve static files (web UI)
+# Serve static files (web UI) — must be last (catch-all mount)
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
