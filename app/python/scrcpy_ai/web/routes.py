@@ -1,5 +1,7 @@
-"""FastAPI routes — all /api/* endpoints."""
+"""FastAPI routes — all /api/* and /auth/* endpoints."""
 
+import base64
+import io
 import json
 import logging
 import os
@@ -8,12 +10,53 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from scrcpy_ai.agent.agent import agent
+from scrcpy_ai.auth import (
+    create_session,
+    get_or_create_secret,
+    get_provisioning_uri,
+    verify_otp,
+)
 from scrcpy_ai.clip.matcher import embed_image_bytes
 from scrcpy_ai.config import config
 from scrcpy_ai.pipeline import recorder
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ── Auth ───────────────────────────────────────────────────────────
+@router.post("/auth/login")
+async def auth_login(request: Request):
+    body = await request.json()
+    code = body.get("code", "")
+    if not verify_otp(code):
+        return JSONResponse({"ok": False, "error": "인증 실패"}, status_code=401)
+    token = create_session()
+    response = JSONResponse({"ok": True})
+    response.set_cookie(
+        key="session",
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=15 * 60,
+    )
+    return response
+
+
+@router.get("/auth/setup")
+async def auth_setup():
+    import qrcode
+
+    uri = get_provisioning_uri()
+    secret = get_or_create_secret()
+
+    img = qrcode.make(uri)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    qr_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    return {"qr_base64": qr_b64, "secret": secret}
 
 
 # ── State ───────────────────────────────────────────────────────────

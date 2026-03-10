@@ -7,9 +7,12 @@ import os
 
 import uvicorn
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
+from scrcpy_ai.auth import is_internal_request, validate_session
 from scrcpy_ai.config import config
 
 logging.basicConfig(
@@ -19,6 +22,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="scrcpy-ai", docs_url=None, redoc_url=None)
+
+# Auth paths that bypass authentication
+_AUTH_WHITELIST = {"/auth/login", "/auth/setup", "/login.html"}
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+
+        # Always allow auth endpoints and static login page
+        if path in _AUTH_WHITELIST:
+            return await call_next(request)
+
+        # Internal requests skip auth
+        client_host = request.client.host if request.client else "127.0.0.1"
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if is_internal_request(client_host, forwarded_for):
+            return await call_next(request)
+
+        # External requests: check session cookie
+        session_token = request.cookies.get("session")
+        if validate_session(session_token):
+            return await call_next(request)
+
+        # Not authenticated: redirect to login
+        login_path = os.path.join(os.path.dirname(__file__), "static", "login.html")
+        return FileResponse(login_path)
+
+
+app.add_middleware(AuthMiddleware)
 
 
 @app.on_event("startup")
