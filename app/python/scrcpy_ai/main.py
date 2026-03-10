@@ -38,7 +38,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # Internal requests skip auth
         client_host = request.client.host if request.client else "127.0.0.1"
         forwarded_for = request.headers.get("x-forwarded-for")
-        if is_internal_request(client_host, forwarded_for):
+        host_header = request.headers.get("host")
+        if is_internal_request(client_host, forwarded_for, host_header):
             return await call_next(request)
 
         # External requests: check session cookie

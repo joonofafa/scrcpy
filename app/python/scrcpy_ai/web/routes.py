@@ -45,7 +45,16 @@ async def auth_login(request: Request):
 
 
 @router.get("/auth/setup")
-async def auth_setup():
+async def auth_setup(request: Request):
+    """QR code setup — internal access only."""
+    from scrcpy_ai.auth import is_internal_request
+
+    client_host = request.client.host if request.client else ""
+    forwarded_for = request.headers.get("x-forwarded-for")
+    host_header = request.headers.get("host")
+    if not is_internal_request(client_host, forwarded_for, host_header):
+        raise HTTPException(403, "internal access only")
+
     import qrcode
 
     uri = get_provisioning_uri()

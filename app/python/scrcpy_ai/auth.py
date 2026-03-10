@@ -84,12 +84,25 @@ def _cleanup_expired():
         _sessions.pop(k, None)
 
 
-def is_internal_request(client_host: str, forwarded_for: str | None) -> bool:
-    """Check if request originates from localhost (not proxied external)."""
-    # If X-Forwarded-For is set, it's coming through Apache proxy = external
+def is_internal_request(client_host: str, forwarded_for: str | None,
+                        host_header: str | None = None) -> bool:
+    """Check if request originates from localhost (not proxied external).
+
+    Key insight: Apache proxy connects from 127.0.0.1, so client_host alone
+    is unreliable. Use multiple signals:
+    - X-Forwarded-For present → proxied → external
+    - Host header is external domain → external
+    - Only truly internal if direct localhost with no proxy indicators
+    """
+    # If X-Forwarded-For is set, request came through a proxy
     if forwarded_for:
-        real_ip = forwarded_for.split(",")[0].strip()
-        if real_ip not in ("127.0.0.1", "::1"):
+        return False
+
+    # If Host header is an external domain, it's external
+    if host_header:
+        h = host_header.split(":")[0].lower()
+        if h not in ("127.0.0.1", "::1", "localhost"):
             return False
-    # Direct connection from localhost
+
+    # Direct connection from localhost with no proxy indicators
     return client_host in ("127.0.0.1", "::1", "localhost")
