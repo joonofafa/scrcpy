@@ -33,11 +33,13 @@ async def auth_login(request: Request):
         return JSONResponse({"ok": False, "error": "인증 실패"}, status_code=401)
     token = create_session()
     response = JSONResponse({"ok": True})
+    # Apache proxies HTTPS→HTTP internally, so check X-Forwarded-Proto
+    is_https = request.headers.get("x-forwarded-proto") == "https"
     response.set_cookie(
         key="session",
         value=token,
         httponly=True,
-        secure=True,
+        secure=is_https,
         samesite="lax",
         max_age=15 * 60,
     )

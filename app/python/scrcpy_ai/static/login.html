@@ -25,7 +25,7 @@ body {
 }
 h1 { font-size: 20px; margin-bottom: 8px; }
 .subtitle { color: #888; font-size: 13px; margin-bottom: 24px; }
-input[type="number"] {
+input[type="tel"] {
     width: 100%;
     padding: 14px;
     font-size: 24px;
@@ -36,15 +36,9 @@ input[type="number"] {
     border-radius: 8px;
     color: #fff;
     outline: none;
-    -moz-appearance: textfield;
 }
-input[type="number"]::-webkit-outer-spin-button,
-input[type="number"]::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-}
-input[type="number"]:focus { border-color: #e94560; }
-input[type="number"]::placeholder {
+input[type="tel"]:focus { border-color: #e94560; }
+input[type="tel"]::placeholder {
     letter-spacing: 2px;
     font-size: 14px;
     color: #666;
@@ -75,7 +69,7 @@ button:hover { background: #c73650; }
     <h1>Remote SCRCPY</h1>
     <p class="subtitle">OTP</p>
     <form id="loginForm">
-        <input type="number" id="otp" maxlength="6"
+        <input type="tel" id="otp" maxlength="6" pattern="[0-9]{6}"
                placeholder="000000" autocomplete="one-time-code"
                inputmode="numeric" autofocus>
         <button type="submit">Login</button>
@@ -87,21 +81,23 @@ const form = document.getElementById('loginForm');
 const otpInput = document.getElementById('otp');
 const errorEl = document.getElementById('error');
 
-// Enforce 6 digit max
+// Only allow digits + auto-submit
 otpInput.addEventListener('input', () => {
-    if (otpInput.value.length > 6) {
-        otpInput.value = otpInput.value.slice(0, 6);
-    }
+    otpInput.value = otpInput.value.replace(/\D/g, '').slice(0, 6);
     if (otpInput.value.length === 6) {
-        form.dispatchEvent(new Event('submit'));
+        doLogin();
     }
 });
 
-form.addEventListener('submit', async (e) => {
+form.addEventListener('submit', (e) => {
     e.preventDefault();
+    doLogin();
+});
+
+async function doLogin() {
     errorEl.textContent = '';
     const code = otpInput.value.trim();
-    if (code.length !== 6) { errorEl.textContent = '6자리 코드를 입력하세요'; return; }
+    if (code.length !== 6) { errorEl.textContent = '6자리 숫자를 입력하세요'; return; }
     try {
         const r = await fetch('/auth/login', {
             method: 'POST',
@@ -110,7 +106,7 @@ form.addEventListener('submit', async (e) => {
         });
         const data = await r.json();
         if (data.ok) {
-            window.location.href = '/';
+            window.location.replace('/?t=' + Date.now());
         } else {
             errorEl.textContent = data.error || '인증 실패';
             otpInput.value = '';
@@ -119,7 +115,7 @@ form.addEventListener('submit', async (e) => {
     } catch (err) {
         errorEl.textContent = '서버 연결 실패';
     }
-});
+}
 </script>
 </body>
 </html>

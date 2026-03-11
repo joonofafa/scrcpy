@@ -47,9 +47,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if validate_session(session_token):
             return await call_next(request)
 
-        # Not authenticated: redirect to login
+        # Not authenticated: serve login page (no-cache to prevent stale redirect)
         login_path = os.path.join(os.path.dirname(__file__), "static", "login.html")
-        return FileResponse(login_path)
+        return FileResponse(login_path, headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+        })
 
 
 app.add_middleware(AuthMiddleware)
