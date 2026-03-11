@@ -901,21 +901,27 @@ async function summarizeRules() {
 }
 
 /* ---------- Recording ---------- */
+let recordPending = false; // prevent polling override during API calls
+
 async function startRecording() {
+  recordPending = true;
   const r = await api('POST', '/api/record/start');
+  recordPending = false;
   if (r) {
     isRecording = true;
     recordCount = 0;
+    recordLogEntries = [];
     updateRecordUI();
   }
 }
 
 async function stopRecording() {
-  const r = await api('POST', '/api/record/stop');
-  if (r) {
-    isRecording = false;
-    updateRecordUI();
-  }
+  // Immediately update UI
+  isRecording = false;
+  updateRecordUI();
+  recordPending = true;
+  await api('POST', '/api/record/stop');
+  recordPending = false;
 }
 
 function updateRecordUI() {
@@ -1395,7 +1401,7 @@ async function pollState() {
   renderAutoState(s.auto_running, s.game_rules, s.play_mode);
   appendAutoLog(s.messages || []);
 
-  if (s.recording !== undefined) {
+  if (s.recording !== undefined && !recordPending) {
     isRecording = s.recording;
     recordCount = s.record_count || 0;
     updateRecordUI();
@@ -1604,11 +1610,14 @@ function sendTouch(action, clientX, clientY) {
   const msg = { type: 'touch', action: action, x: x, y: y, w: vw, h: vh };
   controlWs.send(JSON.stringify(msg));
 
-  // If recording, capture this touch
+  // If recording, capture this touch (fire-and-forget, don't block touch)
   if (isRecording && action === 'down') {
     recordCount++;
-    addRecordLogEntry(x, y, vw, vh, recordCount);
-    api('POST', '/api/record/capture', { x: x, y: y, w: vw, h: vh, index: recordCount });
+    const idx = recordCount;
+    addRecordLogEntry(x, y, vw, vh, idx);
+    updateRecordUI();
+    api('POST', '/api/record/capture', { x: x, y: y, w: vw, h: vh, index: idx })
+      .catch(() => {});
   }
   dbg.textContent = 'Touch: ' + action + ' ' + x + ',' + y + ' (' + vw + 'x' + vh + ')';
 }

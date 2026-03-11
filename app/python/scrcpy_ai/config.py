@@ -45,10 +45,11 @@ class Config:
 
     def __post_init__(self):
         import os
+        base = os.path.expanduser("~/.scrcpy_ai")
         if not self.record_dir:
-            self.record_dir = os.path.expanduser("~/scrcpy_records")
+            self.record_dir = os.path.join(base, "records")
         if not self.db_dir:
-            self.db_dir = os.path.expanduser("~/scrcpy_db")
+            self.db_dir = os.path.join(base, "db")
 
 
 config = Config()

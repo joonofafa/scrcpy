@@ -140,6 +140,7 @@ async def clear_history():
 @router.post("/api/record/start")
 async def record_start():
     agent.recording = True
+    agent._record_session_dir = None  # new session on next capture
     return {"ok": True}
 
 
@@ -149,10 +150,38 @@ async def record_stop():
     return {"ok": True}
 
 
+@router.post("/api/record/capture")
+async def record_capture(request: Request):
+    """Capture current screenshot + touch coordinates during recording."""
+    if not agent.recording:
+        return {"ok": False, "reason": "not recording"}
+    body = await request.json()
+    x = body.get("x", 0)
+    y = body.get("y", 0)
+    index = body.get("index", 0)
+    if not index:
+        raise HTTPException(400, "missing index")
+
+    # Get or create session directory (one per recording session)
+    if not hasattr(agent, '_record_session_dir') or not agent._record_session_dir:
+        agent._record_session_dir = recorder.get_session_dir()
+
+    # Take screenshot from C backend
+    from scrcpy_ai.device import client as device
+    ss = device.screenshot()
+    if not ss:
+        raise HTTPException(500, "screenshot failed")
+
+    recorder.save_capture(agent._record_session_dir, index, ss.jpeg_bytes, x, y)
+    agent.record_count = index
+    return {"ok": True, "index": index}
+
+
 @router.post("/api/record/clear")
 async def record_clear():
     agent.recording = False
     agent.record_count = 0
+    agent._record_session_dir = None
     return {"ok": True}
 
 
