@@ -152,27 +152,24 @@ async def record_stop():
 
 @router.post("/api/record/capture")
 async def record_capture(request: Request):
-    """Capture current screenshot + touch coordinates during recording."""
+    """Save a video frame (from browser) + touch coordinates during recording."""
     if not agent.recording:
         return {"ok": False, "reason": "not recording"}
-    body = await request.json()
-    x = body.get("x", 0)
-    y = body.get("y", 0)
-    index = body.get("index", 0)
-    if not index:
-        raise HTTPException(400, "missing index")
+
+    form = await request.form()
+    frame = form.get("frame")
+    x = int(form.get("x", 0))
+    y = int(form.get("y", 0))
+    index = int(form.get("index", 0))
+    if not index or not frame:
+        raise HTTPException(400, "missing index or frame")
 
     # Get or create session directory (one per recording session)
     if not hasattr(agent, '_record_session_dir') or not agent._record_session_dir:
         agent._record_session_dir = recorder.get_session_dir()
 
-    # Take screenshot from C backend
-    from scrcpy_ai.device import client as device
-    ss = device.screenshot()
-    if not ss:
-        raise HTTPException(500, "screenshot failed")
-
-    recorder.save_capture(agent._record_session_dir, index, ss.jpeg_bytes, x, y)
+    jpeg_bytes = await frame.read()
+    recorder.save_capture(agent._record_session_dir, index, jpeg_bytes, x, y)
     agent.record_count = index
     return {"ok": True, "index": index}
 

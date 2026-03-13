@@ -1696,13 +1696,27 @@ async function sendTouch(action, clientX, clientY) {
       return;
     }
     recordCapturing = true;
-    dbg.textContent = 'Recording: capturing screenshot...';
+    dbg.textContent = 'Recording: capturing frame...';
     try {
+      // Capture current video frame via canvas
+      const frameBlob = await captureVideoFrame();
+      if (!frameBlob) {
+        dbg.textContent = 'Frame capture failed — try again.';
+        recordCapturing = false;
+        return;
+      }
       recordCount++;
       const idx = recordCount;
-      const r = await api('POST', '/api/record/capture', { x: x, y: y, w: vw, h: vh, index: idx });
+      // Upload frame + coordinates
+      const form = new FormData();
+      form.append('frame', frameBlob, idx.toString().padStart(4, '0') + '.jpg');
+      form.append('x', x);
+      form.append('y', y);
+      form.append('index', idx);
+      const resp = await fetch('/api/record/capture', { method: 'POST', body: form });
+      const r = await resp.json();
       if (r && r.ok) {
-        // Screenshot saved — now send the actual touch (down + up = tap)
+        // Frame saved — now send the actual touch (down + up = tap)
         controlWs.send(JSON.stringify({ type: 'touch', action: 'down', x: x, y: y, w: vw, h: vh }));
         controlWs.send(JSON.stringify({ type: 'touch', action: 'up', x: x, y: y, w: vw, h: vh }));
         addRecordLogEntry(x, y, vw, vh, idx);
@@ -1710,7 +1724,7 @@ async function sendTouch(action, clientX, clientY) {
         dbg.textContent = 'Recorded #' + idx + ': ' + x + ',' + y;
       } else {
         recordCount--;
-        dbg.textContent = 'Capture failed — touch ignored. Try again.';
+        dbg.textContent = 'Save failed — touch ignored. Try again.';
       }
     } catch (e) {
       recordCount--;
@@ -1723,6 +1737,18 @@ async function sendTouch(action, clientX, clientY) {
   const msg = { type: 'touch', action: action, x: x, y: y, w: vw, h: vh };
   controlWs.send(JSON.stringify(msg));
   dbg.textContent = 'Touch: ' + action + ' ' + x + ',' + y + ' (' + vw + 'x' + vh + ')';
+}
+
+function captureVideoFrame() {
+  return new Promise(function (resolve) {
+    const video = document.getElementById('remote-video');
+    if (!video || video.readyState < 2) { resolve(null); return; }
+    const c = document.createElement('canvas');
+    c.width = video.videoWidth;
+    c.height = video.videoHeight;
+    c.getContext('2d').drawImage(video, 0, 0);
+    c.toBlob(function (blob) { resolve(blob); }, 'image/jpeg', 0.9);
+  });
 }
 
 function resizeOverlay() {

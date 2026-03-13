@@ -62,8 +62,10 @@ def click(x: int, y: int, w: int = 0, h: int = 0) -> dict:
     try:
         r = get_client().post("/internal/click",
                               json={"x": x, "y": y, "w": w, "h": h})
+        logger.info("click(%d, %d) -> %d", x, y, r.status_code)
         return r.json()
     except Exception as e:
+        logger.error("click(%d, %d) failed: %s", x, y, e)
         return {"error": str(e)}
 
 
