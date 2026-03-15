@@ -1836,8 +1836,10 @@ function resizeOverlay() {
   const overlay = document.getElementById('touch-overlay');
   let isDown = false;
 
+  overlay.addEventListener('contextmenu', (e) => { e.preventDefault(); });
   overlay.addEventListener('mousedown', async (e) => {
     e.preventDefault();
+    if (e.button === 2) { sendKey('back'); return; }
     isDown = true;
     await sendTouch('down', e.clientX, e.clientY);
   });
