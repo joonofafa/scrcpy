@@ -24,6 +24,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _is_safe_session_name(name: str) -> bool:
+    """Validate session name to block traversal and invalid paths."""
+    if not isinstance(name, str) or not name:
+        return False
+    if "/" in name or "\\" in name or ".." in name:
+        return False
+    return os.path.basename(name) == name
+
+
 # ── Auth ───────────────────────────────────────────────────────────
 @router.post("/auth/login")
 async def auth_login(request: Request):
@@ -140,8 +149,17 @@ async def clear_history():
 @router.post("/api/record/start")
 async def record_start():
     agent.recording = True
-    agent._record_session_dir = None  # new session on next capture
-    return {"ok": True}
+    agent.record_count = 0
+    try:
+        # Allocate a dedicated session directory immediately, so it is listed
+        # even when later captures fail.
+        agent._record_session_dir = recorder.get_session_dir()
+        return {"ok": True, "session": os.path.basename(agent._record_session_dir)}
+    except OSError as e:
+        agent.recording = False
+        agent._record_session_dir = None
+        logger.exception("Failed to create recording session directory")
+        raise HTTPException(500, f"failed to create session directory: {e}") from e
 
 
 @router.post("/api/record/stop")
@@ -158,18 +176,42 @@ async def record_capture(request: Request):
 
     form = await request.form()
     frame = form.get("frame")
-    x = int(form.get("x", 0))
-    y = int(form.get("y", 0))
-    index = int(form.get("index", 0))
-    if not index or not frame:
+    try:
+        x = int(form.get("x", 0))
+        y = int(form.get("y", 0))
+        index = int(form.get("index", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "invalid x, y, or index")
+    if index <= 0 or not frame:
         raise HTTPException(400, "missing index or frame")
+    if x < 0 or y < 0:
+        raise HTTPException(400, "invalid touch coordinates")
 
     # Get or create session directory (one per recording session)
     if not hasattr(agent, '_record_session_dir') or not agent._record_session_dir:
-        agent._record_session_dir = recorder.get_session_dir()
+        try:
+            agent._record_session_dir = recorder.get_session_dir()
+        except OSError as e:
+            logger.exception("Failed to lazily create recording session directory")
+            raise HTTPException(500, f"failed to create session directory: {e}") from e
 
     jpeg_bytes = await frame.read()
-    recorder.save_capture(agent._record_session_dir, index, jpeg_bytes, x, y)
+    if not jpeg_bytes:
+        raise HTTPException(400, "empty frame payload")
+    # Defensive bound against abusive uploads.
+    if len(jpeg_bytes) > 12 * 1024 * 1024:
+        raise HTTPException(413, "frame payload too large")
+    try:
+        recorder.save_capture(agent._record_session_dir, index, jpeg_bytes, x, y)
+    except OSError as e:
+        logger.exception(
+            "Failed to save capture (session=%s index=%d size=%d)",
+            agent._record_session_dir, index, len(jpeg_bytes),
+        )
+        return JSONResponse(
+            {"ok": False, "reason": f"save failed: {e}"},
+            status_code=500,
+        )
     agent.record_count = index
     return {"ok": True, "index": index}
 
@@ -190,6 +232,8 @@ async def train_sessions():
 
 @router.get("/api/train/session")
 async def train_session(name: str):
+    if not _is_safe_session_name(name):
+        raise HTTPException(400, "invalid session name")
     return recorder.get_session(name)
 
 
@@ -207,7 +251,7 @@ async def train_session_delete(request: Request):
 # ── Train Images ────────────────────────────────────────────────────
 @router.get("/api/train/image")
 async def train_image(session: str, index: int):
-    if ".." in session or "/" in session:
+    if not _is_safe_session_name(session):
         raise HTTPException(400, "invalid session name")
     path = os.path.join(config.record_dir, session, f"{index:04d}.jpg")
     if not os.path.exists(path):
@@ -222,11 +266,17 @@ async def train_embed(request: Request):
     body = await request.json()
     session = body.get("session", "")
     index = body.get("index", 0)
-    if not session or not index:
+    if not _is_safe_session_name(session):
+        raise HTTPException(400, "invalid session")
+    try:
+        index_int = int(index)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "invalid index")
+    if index_int <= 0:
         raise HTTPException(400, "missing session or index")
 
     # Read image file
-    img_path = os.path.join(config.record_dir, session, f"{int(index):04d}.jpg")
+    img_path = os.path.join(config.record_dir, session, f"{index_int:04d}.jpg")
     if not os.path.exists(img_path):
         raise HTTPException(404, "image not found")
 
@@ -241,11 +291,12 @@ async def train_embed(request: Request):
     embeddings = recorder.load_embeddings(session) or []
 
     # Read touch coordinates
-    txt_path = os.path.join(config.record_dir, session, f"{int(index):04d}.txt")
+    txt_path = os.path.join(config.record_dir, session, f"{index_int:04d}.txt")
     x, y = 0, 0
     if os.path.exists(txt_path):
         try:
-            parts = open(txt_path).read().strip().split(",")
+            with open(txt_path) as f:
+                parts = f.read().strip().split(",")
             x, y = int(parts[0]), int(parts[1])
         except (ValueError, IndexError):
             pass
@@ -253,7 +304,7 @@ async def train_embed(request: Request):
     # Update or append
     found = False
     for e in embeddings:
-        if e.get("index") == index:
+        if e.get("index") == index_int:
             e["embedding"] = emb.tolist()
             e["x"] = x
             e["y"] = y
@@ -261,7 +312,7 @@ async def train_embed(request: Request):
             break
     if not found:
         embeddings.append({
-            "index": index,
+            "index": index_int,
             "x": x,
             "y": y,
             "embedding": emb.tolist(),
@@ -273,6 +324,8 @@ async def train_embed(request: Request):
 
 @router.get("/api/train/embeddings")
 async def train_embeddings(session: str):
+    if not _is_safe_session_name(session):
+        raise HTTPException(400, "invalid session")
     data = recorder.load_embeddings(session)
     return data or []
 
@@ -282,8 +335,8 @@ async def train_embeddings(session: str):
 async def clip_load(request: Request):
     body = await request.json()
     session = body.get("session", "")
-    if not session:
-        raise HTTPException(400, "missing session")
+    if not _is_safe_session_name(session):
+        raise HTTPException(400, "invalid session")
     data = recorder.load_embeddings(session)
     if not data:
         raise HTTPException(404, "no embeddings found")
@@ -323,6 +376,8 @@ async def memory_clear_history():
 @router.get("/api/train/labels")
 async def train_labels(session: str):
     import json
+    if not _is_safe_session_name(session):
+        raise HTTPException(400, "invalid session")
     labels_path = os.path.join(config.record_dir, session, "labels.json")
     if not os.path.exists(labels_path):
         return {"ok": True}
@@ -339,8 +394,10 @@ async def train_save(request: Request):
     body = await request.json()
     session = body.get("session")
     labels = body.get("labels", {})
-    if not session:
-        raise HTTPException(400, "missing session")
+    if not _is_safe_session_name(session):
+        raise HTTPException(400, "invalid session")
+    if not isinstance(labels, dict):
+        raise HTTPException(400, "invalid labels")
 
     # Save labels to labels.json in session directory
     import json
